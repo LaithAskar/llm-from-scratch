@@ -1,0 +1,10 @@
+# Install PyTorch with CUDA 12.4 first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+# Then:
+#   pip install -r requirements.txt
+
+tiktoken>=0.7.0
+numpy>=1.26
+matplotlib>=3.8
+tqdm>=4.66
+pytest>=8.0
