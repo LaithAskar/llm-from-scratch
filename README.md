@@ -16,11 +16,17 @@ Trained on an NVIDIA RTX 4060 Laptop GPU (8 GB VRAM), Windows 11. Everything is 
 
 | Phase | Goal | Status |
 |---|---|---|
+| Week 0 | CUDA-enabled PyTorch, deps, `verify_setup.py` green | done |
 | Part 1 | Core Transformer (attention, MHA, FFN, residuals, LayerNorm) | not started |
 | Part 2 | Train a tiny LM on character-level data | not started |
 | Part 3 | Modernize: RMSNorm, RoPE, SwiGLU, KV cache | not started |
 | Ablation | Measure delta of each modern component vs baseline | not started |
 | Writeup | `ABLATION.md` with curves, hypotheses, surprises | not started |
+
+**Verified environment (2026-05-04):**
+- Python 3.13.13, PyTorch 2.6.0+cu124
+- NVIDIA GeForce RTX 4060 Laptop GPU, 8.0 GB VRAM, driver 581.83
+- `verify_setup.py` passes (CUDA available, matmul on device, all deps importable)
 
 Parts 4–9 of the source course (BPE training, MoE, SFT, reward modeling, PPO, GRPO) are intentionally **not implemented here** — they require compute beyond a single 8 GB GPU and would dilute the focus of this project. They are studied conceptually but not reproduced.
 
