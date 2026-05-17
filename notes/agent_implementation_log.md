@@ -271,5 +271,249 @@ freedom on the core algorithm. The only judgment call was:
 
 ---
 
-<!-- Next entries (MultiHeadAttention, GELU FFN, SwiGLU FFN, RoPE,
-     TransformerBlock) appended as components land. -->
+## 3. `MultiHeadAttention(embed_dim, num_heads, dropout, bias, rotary)`
+
+**File:** `layers.py:46-112`
+**Tests:** `tests/test_layers.py:153-289` (8 cases)
+**Patch status:** real implementation; MHA was never patched in conftest
+(the patch was on `TransformerBlock`, which constructs MHA — MHA is still
+unreachable through model.py until TransformerBlock lands).
+
+### Design
+
+Scaled dot-product multi-head attention, Vaswani et al. 2017 §3.2. The
+whole implementation is ~25 lines because virtually all the work is
+*reshaping tensors* so that one batched matmul computes H heads' attention
+simultaneously.
+
+**API choices that differ from the stub:**
+
+1. **Added `bias: bool = False` constructor param.** The stub didn't take
+   bias but the project's `ModelConfig.bias` exists and needs to plumb
+   somewhere — TransformerBlock will pass `config.bias`. Defaulting to
+   `False` matches LLaMA / PaLM convention. The stub's TODO explicitly
+   flagged this as a design call.
+
+2. **Added `rotary: Optional[Callable]` constructor param.** RoPE has to
+   happen *inside* MHA, between head-split and the scores matmul, because
+   it rotates Q and K. Rather than coupling MHA to the project's Config
+   (`if config.pos_encoding == "rope":` inside MHA), I made it a callable
+   slot. TransformerBlock will construct an `apply_rotary(q, k)` and pass
+   it. `None` means no rotation (learned-absolute pos lives at the
+   embedding level in model.py).
+
+### Walkthrough (forward)
+
+```python
+def forward(self, x, mask=None):
+    B, T, C = x.shape
+    H, D = self.num_heads, self.head_dim
+```
+
+Unpack input shape and head dims. `C` (input embed_dim) equals `H * D`
+(num_heads × head_dim) by construction.
+
+```python
+    q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
+    k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
+    v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
+```
+
+Project x through three independent Linear layers (each `C → C`), then
+reshape to expose the head dim and transpose to put heads in front of time.
+
+- `view(B, T, H, D)` reinterprets the contiguous `(B, T, C)` tensor as
+  `(B, T, H, D)` without copy. `view` requires contiguity, which `q_proj(x)`
+  output has by default.
+- `transpose(1, 2)` swaps the T and H axes, giving `(B, H, T, D)`. Heads
+  now sit on a batch-like axis, so the next matmul broadcasts across them.
+
+**Note:** transpose returns a non-contiguous view. That's fine for matmul
+(which doesn't require contiguity) but matters later when we have to
+re-merge heads — see the `.contiguous()` call below.
+
+```python
+    if self.rotary is not None:
+        q, k = self.rotary(q, k)
+```
+
+The RoPE hook. No-op when not provided. When TransformerBlock wires this
+up with `pos_encoding="rope"`, a Rotary module is passed that rotates each
+Q and K vector by a position-dependent angle. V is *not* rotated — V
+carries content, not position.
+
+```python
+    scores = (q @ k.transpose(-2, -1)) / math.sqrt(D)
+```
+
+The attention scores matmul. `k.transpose(-2, -1)` swaps the last two dims
+of K, so K becomes `(B, H, D, T)`. Then `q @ k_T`:
+
+`(B, H, T, D) @ (B, H, D, T) -> (B, H, T, T)`
+
+Each `(T, T)` block in the result is `score[q_pos, k_pos]` = dot product
+of the query at `q_pos` with the key at `k_pos`. Divided by `sqrt(D)` to
+keep score variance ~1 regardless of head dim (otherwise softmax
+saturates as D grows; see interview Qs).
+
+```python
+    if mask is not None:
+        scores = scores.masked_fill(~mask, float("-inf"))
+```
+
+The mask is `(T, T)` bool, project convention "True == attend." `masked_fill`
+fills *where the predicate is True*, so we invert with `~` to fill where
+the mask says False. `-inf` becomes `exp(-inf) = 0` after softmax, giving
+masked positions zero attention weight.
+
+Broadcasting: `(T, T)` against `(B, H, T, T)`. PyTorch right-aligns dims
+and broadcasts singleton or missing dims, so the `(T, T)` mask is
+implicitly `(1, 1, T, T)`. **The same mask applies to every batch and
+every head**, which is correct for causal attention.
+
+```python
+    attn = F.softmax(scores, dim=-1)
+    attn = self.attn_dropout(attn)
+```
+
+Softmax along the *keys* dim (last). For each query position, this gives
+a probability distribution over which key positions to attend to. Dropout
+applied to the attention weights themselves (standard practice; this is
+sometimes called "attention dropout" vs the input dropout in
+TransformerBlock).
+
+```python
+    out = attn @ v
+```
+
+`(B, H, T, T) @ (B, H, T, D) -> (B, H, T, D)`. Each output position is a
+weighted sum of the value vectors using the per-position attention weights.
+
+```python
+    out = out.transpose(1, 2).contiguous().view(B, T, C)
+    return self.out_proj(out)
+```
+
+Merge heads. Transpose back to `(B, T, H, D)`. `.contiguous()` is required
+here because the transpose left the tensor non-contiguous; `view(B, T, C)`
+needs contiguity to reinterpret the flat memory. Without `.contiguous()`,
+PyTorch raises a stride error. (Alt: `.reshape(B, T, C)` would handle the
+contiguity decision implicitly, at the cost of being slightly less explicit
+about the cost.)
+
+Final `out_proj` is a learned linear mixing across heads. This is what
+turns the concatenated per-head outputs back into a single embed_dim
+vector.
+
+### Interview Qs you should be able to answer
+
+- **Why divide scores by `sqrt(D)`?**
+  Q and K elements are roughly N(0, 1) at init (Gaussian via `_init_weights`).
+  Their dot product over D elements is a sum of D iid products, so it has
+  variance ~D and standard deviation ~sqrt(D). Without rescaling, the
+  softmax inputs grow as D grows, eventually pushing into the saturated
+  regime where one logit dominates everything. Then `d(softmax)/d(input) → 0`
+  and gradients vanish. Dividing by sqrt(D) keeps the score distribution
+  at variance ~1 regardless of head dim, which keeps softmax in its
+  responsive range.
+
+- **Why softmax over the last dim (the keys axis)?**
+  For each query position, we're computing "given this query, how much
+  weight on each key position?" — that's a distribution over keys, so
+  softmax goes over the keys axis. Softmax over the queries axis would
+  normalize across queries, producing per-key attention weights, which is
+  a wrong semantics.
+
+- **Why `-inf` for masked positions instead of 0?**
+  Softmax: `exp(score) / Σ exp(score)`. `exp(-inf) = 0` (zero probability).
+  `exp(0) = 1` (same weight as an unmasked logit of 0). The 0-fill would
+  give masked positions exactly as much weight as a real low-score position,
+  which is a correctness bug, not a perf issue.
+
+- **What's the memory cost of the `(T, T)` score matrix and why does it
+  motivate Flash Attention?**
+  Per layer: `B * H * T * T * sizeof(dtype)`. At `B=8, H=32, T=2048, fp16`
+  that's ~2 GB *just for one layer's intermediate scores*, and it has to
+  fit in HBM. Flash Attention restructures the computation so scores are
+  computed in tile-sized chunks that fit in SRAM (much faster than HBM
+  reads/writes) and the full `T*T` matrix never materializes. Trade: ~2x
+  fewer FLOPs visible to PyTorch, ~3-9x faster wall-clock in practice.
+
+- **Why bias=False on the Q/K/V linears?**
+  Empirically not load-bearing. There's a structural argument too: a bias
+  on Q is equivalent to shifting Q by a constant per position; if that
+  same shift were also on K (it'd have its own bias), the dot product
+  `Q·K^T = (q+b_q)·(k+b_k)^T` adds bias-dependent terms that softmax
+  partially normalizes out. Most modern LLMs (LLaMA, PaLM, Mistral) use
+  bias=False; the param savings are tiny but the principle of "remove
+  what doesn't help" applies. Vaswani used bias=True; the original choice
+  wasn't ablated, and later work removed it without quality loss.
+
+- **What does `.contiguous()` do and why is it needed before `view`?**
+  PyTorch tensors have a `data` buffer and a `stride` tuple that maps
+  multi-dim indices to flat-buffer offsets. Most ops produce strides that
+  match a row-major layout (contiguous). `transpose` swaps two strides
+  without copying memory, leaving the tensor non-contiguous. `view`
+  requires contiguity because it reinterprets the underlying flat memory
+  with new strides — it can't reorder bytes. `.contiguous()` copies the
+  tensor into a new buffer with row-major layout. Skipping it on a
+  post-transpose tensor raises `view size is not compatible with input
+  tensor's size and stride`.
+
+- **What's the FLOPs breakdown per attention call?**
+  Three projections: 3 × B × T × C² ≈ 3BTC². Scores matmul:
+  B × H × T² × D = BT²C. Attn-V matmul: same, BT²C. Output projection:
+  BTC². Total: 4BTC² + 2BT²C. The T² terms dominate at long context —
+  which is the other reason Flash Attention matters.
+
+### Test coverage
+
+`tests/test_layers.py` (8 cases):
+- `test_mha_output_shape_matches_input` — `(B, T, C)` in, `(B, T, C)` out.
+- `test_mha_rejects_non_divisible_dims` — `ValueError` on
+  `embed_dim % num_heads != 0`.
+- `test_mha_gradient_flows_to_all_params` — every named parameter gets a
+  finite gradient.
+- **`test_mha_causal_mask_blocks_future_information`** — the load-bearing
+  correctness test. Perturbing position 1's input must NOT change
+  position 0's output (it's masked from seeing it), but position 1's
+  output WILL change. Catches: inverted mask convention, missing mask
+  broadcast, mask dtype/shape mismatches. If this passes, the mask plumbing
+  is correct.
+- `test_mha_no_mask_mixes_all_positions` — without a mask, position 0
+  responds to perturbations at position 3. Confirms attention actually
+  attends (not just an MLP in disguise).
+- `test_mha_param_count_bias_off_vs_on` — `bias=True` adds exactly
+  `4 * embed_dim` params (4 linears, embed_dim bias each).
+- `test_mha_dropout_is_noop_in_eval_mode` — `nn.Dropout` is automatically
+  identity in `eval()`, two forwards give identical outputs.
+- `test_mha_calls_rotary_hook_if_provided` — a no-op rotary gives output
+  identical to no rotary; a scaling rotary still produces correct-shape
+  output. Verifies the hook is actually wired without testing RoPE's
+  semantics (that's RoPE's test).
+
+### Common bugs this implementation avoids
+
+- **Inverted mask convention.** `causal_mask` returns True-means-attend,
+  but `masked_fill` writes where the predicate is True — these are opposite,
+  so `~mask` is required. Forgetting this would mask exactly the positions
+  you wanted to keep. Caught by `test_mha_causal_mask_blocks_future_information`.
+- **Missing `.contiguous()` after transpose.** Would error out on the `view`
+  call. Caught by every shape test.
+- **Wrong axis for softmax.** Caught by `test_mha_no_mask_mixes_all_positions`
+  (wrong axis would still produce shape-correct output but with broken
+  attention semantics).
+- **head_dim not stored.** Would force re-derivation in forward; not a
+  correctness bug but a code-smell. Stored in `__init__`.
+
+### Why no integration with model.py yet
+
+MHA is constructed by `TransformerBlock`, which is still a stub. The
+`DummyBlock` in `tests/_dummies.py` replaces TransformerBlock entirely
+during model.py tests, so the real MHA isn't exercised through the model
+yet. That happens in step 6 (TransformerBlock implementation).
+
+---
+
+<!-- Next entries (GELU FFN, SwiGLU FFN, RoPE, TransformerBlock) appended
+     as components land. -->

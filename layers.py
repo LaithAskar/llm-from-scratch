@@ -8,10 +8,11 @@ the upstream reference repo.
 from __future__ import annotations
 
 import math
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MultiHeadAttention(nn.Module):
@@ -48,61 +49,67 @@ class MultiHeadAttention(nn.Module):
         embed_dim: int,
         num_heads: int,
         dropout: float = 0.0,
+        bias: bool = False,
+        rotary: Optional[Callable[[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]] = None,
     ):
         super().__init__()
-
-        # TODO: assert embed_dim % num_heads == 0 with a helpful error message.
-
-        # TODO: store embed_dim, num_heads, head_dim as instance attributes.
-
-        # TODO: create three nn.Linear projections for Q, K, V.
-        #       Each: embed_dim -> embed_dim. Bias is optional (decide and
-        #       justify your choice in a comment — Vaswani uses bias=True;
-        #       many modern LLMs use bias=False).
-
-        # TODO: create the output projection nn.Linear(embed_dim, embed_dim).
-
-        # TODO: create nn.Dropout for attention weights.
-
-        raise NotImplementedError("Implement __init__ for MultiHeadAttention.")
+        if embed_dim % num_heads != 0:
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+            )
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        # bias=False matches LLaMA / PaLM convention; the project's
+        # config.bias plumbs through here from TransformerBlock.
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.attn_dropout = nn.Dropout(dropout)
+        # If set, called as (q, k) -> (q_rot, k_rot) between head-split and
+        # scores. None = no positional rotation (learned-absolute pos is
+        # handled in model.py at the embedding level).
+        self.rotary = rotary
 
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Expected: x.shape == (B, T, C) where C == self.embed_dim.
+        B, T, C = x.shape
+        H, D = self.num_heads, self.head_dim
 
-        # Step 1: linear projections.
-        # TODO: compute q, k, v from x via your three projections.
-        #       Each result has shape (B, T, C).
+        # Project and split into heads in one expression per tensor.
+        # view(B, T, H, D) puts heads on a new axis; transpose(1, 2) moves
+        # heads in front of time so attention is a batched per-head matmul.
+        q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
+        k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
 
-        # Step 2: split into heads.
-        # TODO: reshape each of q, k, v to (B, T, H, head_dim) and then
-        #       transpose to (B, H, T, head_dim) so attention is per-head.
+        if self.rotary is not None:
+            q, k = self.rotary(q, k)
 
-        # Step 3: scaled dot-product scores.
-        # TODO: scores = q @ k.transpose(-2, -1) / sqrt(head_dim)
-        #       shape: (B, H, T, T).
+        # Scaled dot-product scores. (B, H, T, D) @ (B, H, D, T) -> (B, H, T, T).
+        scores = (q @ k.transpose(-2, -1)) / math.sqrt(D)
 
-        # Step 4: apply mask (if provided).
-        # TODO: scores = scores.masked_fill(mask == 0, float('-inf')) or
-        #       equivalent. Be careful about mask broadcasting shape.
+        if mask is not None:
+            # Convention: mask True == attend, False == mask out (project
+            # convention, set by causal_mask). masked_fill writes where the
+            # predicate is True, so we invert.
+            # Shape (T, T) bool broadcasts across (B, H) automatically.
+            scores = scores.masked_fill(~mask, float("-inf"))
 
-        # Step 5: softmax + dropout.
-        # TODO: attn = softmax over the last dim. attn = self.dropout(attn).
+        attn = F.softmax(scores, dim=-1)
+        attn = self.attn_dropout(attn)
 
-        # Step 6: weighted sum of values.
-        # TODO: out = attn @ v, shape (B, H, T, head_dim).
+        # (B, H, T, T) @ (B, H, T, D) -> (B, H, T, D).
+        out = attn @ v
 
-        # Step 7: merge heads.
-        # TODO: transpose back to (B, T, H, head_dim), then reshape to
-        #       (B, T, C). Use .contiguous() before reshape if needed.
-
-        # Step 8: output projection.
-        # TODO: out = self.out_proj(out). Return out.
-
-        raise NotImplementedError("Implement forward for MultiHeadAttention.")
+        # Merge heads back: transpose breaks contiguity, so .contiguous()
+        # before view() to avoid a stride error.
+        out = out.transpose(1, 2).contiguous().view(B, T, C)
+        return self.out_proj(out)
 
 
 def causal_mask(seq_len: int, device: Optional[torch.device] = None) -> torch.Tensor:
