@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from layers import GeluFFN, MultiHeadAttention, RMSNorm, SwiGLUFFN, causal_mask
+from layers import GeluFFN, MultiHeadAttention, RMSNorm, RotaryEmbedding, SwiGLUFFN, causal_mask
 
 
 # --- causal_mask -----------------------------------------------------------
@@ -354,3 +354,130 @@ def test_swiglu_ffn_gradient_flows():
     assert x.grad is not None and torch.isfinite(x.grad).all()
     for n, p in ffn.named_parameters():
         assert p.grad is not None and torch.isfinite(p.grad).all(), f"bad grad on {n}"
+
+
+# --- RotaryEmbedding -------------------------------------------------------
+
+
+def test_rope_rejects_odd_head_dim():
+    with pytest.raises(ValueError, match="even"):
+        RotaryEmbedding(head_dim=7, max_seq_len=16)
+
+
+def test_rope_output_shape_matches_input():
+    rope = RotaryEmbedding(head_dim=8, max_seq_len=16)
+    q = torch.randn(2, 4, 10, 8)
+    k = torch.randn(2, 4, 10, 8)
+    q_rot, k_rot = rope(q, k)
+    assert q_rot.shape == q.shape
+    assert k_rot.shape == k.shape
+
+
+def test_rope_is_identity_at_position_zero():
+    """
+    cos(0) = 1, sin(0) = 0 → rotation at position 0 is the identity.
+    The first row of the rotated tensor must equal the input's first row.
+    """
+    rope = RotaryEmbedding(head_dim=8, max_seq_len=16)
+    q = torch.randn(1, 1, 4, 8)
+    k = torch.randn(1, 1, 4, 8)
+    q_rot, k_rot = rope(q, k)
+    assert torch.allclose(q_rot[..., 0, :], q[..., 0, :], atol=1e-6)
+    assert torch.allclose(k_rot[..., 0, :], k[..., 0, :], atol=1e-6)
+
+
+def test_rope_relative_position_invariance():
+    """
+    THE defining property of RoPE: dot(R(mθ)·q, R(nθ)·k) depends only on
+    (m - n), not on m and n individually.
+
+    Place a fixed (q, k) pair at offsets (0, 1) and again at (5, 6). Both
+    have relative offset 1. The attention score must be identical.
+
+    If this fails, the RoPE rotation math is wrong (half-split convention
+    inverted, cos/sin swapped, pair indexing wrong, etc.).
+    """
+    torch.manual_seed(0)
+    head_dim = 16
+    rope = RotaryEmbedding(head_dim=head_dim, max_seq_len=32)
+
+    q_vec = torch.randn(head_dim)
+    k_vec = torch.randn(head_dim)
+
+    # Place at (0, 1): score(rotated_q@0, rotated_k@1)
+    q1 = torch.zeros(1, 1, 32, head_dim)
+    k1 = torch.zeros(1, 1, 32, head_dim)
+    q1[0, 0, 0] = q_vec
+    k1[0, 0, 1] = k_vec
+    q1_rot, k1_rot = rope(q1, k1)
+    score_01 = (q1_rot[0, 0, 0] * k1_rot[0, 0, 1]).sum()
+
+    # Place at (5, 6): same relative offset
+    q2 = torch.zeros(1, 1, 32, head_dim)
+    k2 = torch.zeros(1, 1, 32, head_dim)
+    q2[0, 0, 5] = q_vec
+    k2[0, 0, 6] = k_vec
+    q2_rot, k2_rot = rope(q2, k2)
+    score_56 = (q2_rot[0, 0, 5] * k2_rot[0, 0, 6]).sum()
+
+    assert torch.allclose(score_01, score_56, atol=1e-5), (
+        f"RoPE not translation-invariant: score(0,1)={score_01.item():.6f}, "
+        f"score(5,6)={score_56.item():.6f}"
+    )
+
+
+def test_rope_different_offsets_give_different_scores():
+    """
+    Sanity check the inverse: different relative offsets SHOULD produce
+    different scores (otherwise RoPE is doing nothing).
+    """
+    torch.manual_seed(1)
+    head_dim = 16
+    rope = RotaryEmbedding(head_dim=head_dim, max_seq_len=32)
+
+    q_vec = torch.randn(head_dim)
+    k_vec = torch.randn(head_dim)
+
+    def score_at(q_pos, k_pos):
+        q = torch.zeros(1, 1, 32, head_dim)
+        k = torch.zeros(1, 1, 32, head_dim)
+        q[0, 0, q_pos] = q_vec
+        k[0, 0, k_pos] = k_vec
+        q_r, k_r = rope(q, k)
+        return (q_r[0, 0, q_pos] * k_r[0, 0, k_pos]).sum().item()
+
+    s1 = score_at(0, 1)   # offset = 1
+    s3 = score_at(0, 3)   # offset = 3
+    assert abs(s1 - s3) > 1e-3, "scores at different offsets are suspiciously equal"
+
+
+def test_rope_rejects_overlong_sequence():
+    rope = RotaryEmbedding(head_dim=8, max_seq_len=4)
+    q = torch.randn(1, 1, 10, 8)  # T=10 > max=4
+    k = torch.randn(1, 1, 10, 8)
+    with pytest.raises(ValueError, match="exceeds RoPE max_seq_len"):
+        rope(q, k)
+
+
+def test_rope_gradient_flows():
+    rope = RotaryEmbedding(head_dim=8, max_seq_len=16)
+    q = torch.randn(1, 2, 4, 8, requires_grad=True)
+    k = torch.randn(1, 2, 4, 8, requires_grad=True)
+    q_rot, k_rot = rope(q, k)
+    (q_rot.sum() + k_rot.sum()).backward()
+    assert q.grad is not None and torch.isfinite(q.grad).all()
+    assert k.grad is not None and torch.isfinite(k.grad).all()
+
+
+def test_rope_integrates_with_mha():
+    """
+    End-to-end: hand MHA a RotaryEmbedding via its rotary= constructor
+    arg, run a forward, output shape matches input.
+    """
+    torch.manual_seed(0)
+    rope = RotaryEmbedding(head_dim=8, max_seq_len=16)
+    mha = MultiHeadAttention(embed_dim=32, num_heads=4, rotary=rope)
+    mha.eval()
+    x = torch.randn(1, 6, 32)
+    out = mha(x)
+    assert out.shape == x.shape

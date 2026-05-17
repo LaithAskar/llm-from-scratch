@@ -659,4 +659,200 @@ elsewhere.
 
 ---
 
-<!-- Next entries (RoPE, TransformerBlock) appended as components land. -->
+## 6. `RotaryEmbedding(head_dim, max_seq_len, base)` + `_apply_rotary`
+
+**File:** `layers.py:165-228`
+**Tests:** `tests/test_layers.py:376-490` (8 cases)
+**Patch status:** N/A — new class.
+
+### Design
+
+Su et al. 2021. Instead of adding a position vector to the token embedding,
+*rotate* each Q and K vector by a position-dependent angle. The dot product
+of two rotated vectors depends only on their *relative* offset:
+
+```
+dot( R(mθ)·q, R(nθ)·k ) = q · R((n-m)θ) · k
+```
+
+(Rotations compose through dot products as the difference of their angles.)
+This means `score[m, n]` only depends on `m - n`, not on `m` and `n`
+individually — an inductive bias toward relative position that learned-
+absolute pos doesn't have.
+
+**Half-split convention** (LLaMA / Hugging Face). For head_dim `D`, pair
+element `i` with element `i + D/2`. The first half is "real components,"
+the second half is "imaginary components." Each pair is rotated by
+`m * inv_freq[i]` where:
+
+```
+inv_freq[i] = 1 / base^(2i / D)        for i = 0, ..., D/2 - 1
+```
+
+`base = 10000` is inherited from Transformer's sinusoidal positional
+encoding. Higher `base` → longer wavelengths in the frequency tail →
+better extrapolation to unseen long contexts. LLaMA-2 raised it to 500000
+for the same reason.
+
+**Alternative: interleaved convention.** Some implementations pair adjacent
+elements `(q[0], q[1]), (q[2], q[3]), ...` instead of half-split. Equivalent
+math, different memory access pattern. Half-split is one slice per half
+(contiguous), interleaved needs strided indexing. Half-split is slightly
+faster on most GPUs. **Both conventions need Q and K to agree** — if MHA's
+Q used half-split and K used interleaved, the rotations would be incompatible.
+
+### Walkthrough
+
+```python
+def __init__(self, head_dim, max_seq_len, base=10000.0):
+    super().__init__()
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim ({head_dim}) must be even for RoPE")
+    self.head_dim = head_dim
+    inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+    positions = torch.arange(max_seq_len, dtype=torch.float32)
+    freqs = torch.outer(positions, inv_freq)
+    self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+    self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+```
+
+Precompute everything in `__init__`:
+
+1. **Validate even head_dim.** Pairs require it.
+2. **Compute inv_freqs** of shape `(D/2,)`. The exponent `2i/D` over `i = 0,
+   ..., D/2-1` means `i=0` gives `inv_freq = 1` (high frequency, fast
+   rotation per position) and `i = D/2-1` gives `~1/base` (low frequency,
+   slow rotation per position). The geometric spread across pair indices
+   is what gives RoPE its multi-scale position encoding.
+3. **Outer product positions × inv_freqs.** Result shape `(max_seq_len, D/2)`.
+   Element `(m, i)` is `m * inv_freq[i]` — the rotation angle for position
+   `m` at pair `i`.
+4. **Register cos/sin as non-persistent buffers.** Non-persistent means they
+   don't go into the state_dict — every load regenerates them. This avoids
+   bloating checkpoints with derivable data. They still move with
+   `.to(device)` because they're registered buffers.
+
+```python
+def forward(self, q, k):
+    T = q.size(-2)
+    if T > self.cos_cached.size(0):
+        raise ValueError(...)
+    cos = self.cos_cached[:T]
+    sin = self.sin_cached[:T]
+    return _apply_rotary(q, cos, sin), _apply_rotary(k, cos, sin)
+```
+
+Slice the cache to actual sequence length, apply rotation to both Q and K,
+return. V is NOT rotated — content vectors shouldn't be position-dependent;
+only the attention weights (computed from Q·K^T) should be.
+
+### `_apply_rotary` walkthrough
+
+```python
+def _apply_rotary(x, cos, sin):
+    D = x.size(-1)
+    half = D // 2
+    x1 = x[..., :half]                       # (..., D/2)
+    x2 = x[..., half:]                       # (..., D/2)
+    cos_x = cos.to(x.dtype)
+    sin_x = sin.to(x.dtype)
+    out1 = x1 * cos_x - x2 * sin_x
+    out2 = x1 * sin_x + x2 * cos_x
+    return torch.cat((out1, out2), dim=-1)
+```
+
+The half-split rotation. Each pair `(x1[..., i], x2[..., i])` becomes
+`(x1*cos - x2*sin, x1*sin + x2*cos)` — that's a 2D rotation matrix applied
+to each pair.
+
+**Dtype cast.** The cache is fp32 (for precision when generating cos/sin).
+Without `cos.to(x.dtype)`, multiplying `x: bf16` by `cos: fp32` promotes
+the whole result to fp32, breaking AMP. Casting cos/sin to x's dtype keeps
+the computation in the model's working dtype.
+
+**Broadcasting.** `cos` and `sin` are shape `(T, D/2)`. `x1, x2` are shape
+`(B, H, T, D/2)`. PyTorch right-aligns dims: `(T, D/2)` broadcasts as
+`(1, 1, T, D/2)` against `(B, H, T, D/2)`. The same cos/sin applies to
+every batch and every head — exactly what we want, since RoPE is purely
+positional.
+
+### Interview Qs
+
+- **Why does RoPE give *relative* positions?**
+  Inner product: `(R(mθ)·q) · (R(nθ)·k) = q · R(-mθ)·R(nθ) · k = q · R((n-m)θ) · k`.
+  Rotations commute through the inner product as a difference. The score
+  depends only on `n - m`.
+
+- **Why even head_dim?**
+  RoPE pairs elements. Odd dim has a leftover element with no pair partner.
+
+- **Why `base = 10000`?**
+  Inherited from the original Transformer's sinusoidal positional encoding,
+  where it was chosen so wavelengths span from 2π to 10000·2π — covering
+  position-scale variation from token-level to sentence-level. RoPE
+  recycles the same convention. Higher base → longer wavelengths in the
+  tail → smaller per-position rotation at low-frequency pairs → better
+  long-context behavior. LLaMA-2 raised base to 500000 to extend the
+  context window without retraining the rotation cache.
+
+- **Why precompute and cache cos/sin?**
+  Computing `sin(m * inv_freq)` per forward would be wasteful. They depend
+  only on position and frequency, not on the input — compute once at
+  `__init__`. Non-persistent buffer means they regenerate on load instead
+  of inflating checkpoint size by `2 * max_seq_len * head_dim/2 * 4 bytes`.
+
+- **Why fp32 for the cache, then cast to input dtype at use?**
+  Precision: at large positions (`m = 2000+`), `m * inv_freq` accumulates
+  enough that bf16's small mantissa starts losing digits in the
+  trigonometry. Computing in fp32 then casting at the use site gets the
+  best of both — precise angles, dtype-consistent multiplications.
+
+- **Why is V not rotated?**
+  V is the value being mixed; rotating it would entangle position with
+  content. The desired effect — making attention scores position-aware —
+  is achieved entirely by rotating Q and K. After softmax, the weighted
+  sum of (un-rotated) Vs gives the right answer.
+
+- **Half-split vs interleaved — does the math change?**
+  No, the rotation is the same set of 2D rotations applied to the same
+  pairs of elements. Only the indexing convention differs (which element
+  is "the partner" of element `i`). Hugging Face and LLaMA both use
+  half-split; some older implementations use interleaved. The two are
+  not interoperable at the *weights* level (a model trained with one
+  convention can't load weights from the other without re-ordering), but
+  both produce valid RoPE.
+
+### Test coverage
+
+`tests/test_layers.py` (8 cases):
+- `test_rope_rejects_odd_head_dim` — ValueError on odd dim.
+- `test_rope_output_shape_matches_input` — shape preserved.
+- `test_rope_is_identity_at_position_zero` — `cos(0)=1, sin(0)=0`,
+  so position 0's rotation is identity. Sanity floor.
+- **`test_rope_relative_position_invariance`** — the load-bearing test.
+  Fixed (q, k) at offset (0,1) and at offset (5,6) give identical scores.
+  Catches: half-split inversion, cos/sin swap, wrong pair indexing,
+  forgetting the negative sign on the sin term, broadcasting bugs.
+  If this passes, the rotation math is correct.
+- `test_rope_different_offsets_give_different_scores` — inverse sanity:
+  different relative offsets give different scores (else RoPE is doing
+  nothing).
+- `test_rope_rejects_overlong_sequence` — clear error message instead of
+  silent indexing OOB.
+- `test_rope_gradient_flows` — q and k get gradient. (RoPE has no params,
+  so we just check the call doesn't break autograd.)
+- `test_rope_integrates_with_mha` — end-to-end: hand MHA a RotaryEmbedding
+  via constructor, run forward, output shape matches. Confirms the
+  callable contract.
+
+### Why no parameters?
+
+RoPE is a pure function of position and pair index. All angles are
+deterministic; nothing learnable. This is a strong inductive bias and a
+small param savings over learned-absolute pos (which adds `context_len *
+d_model` params). Empirically the bias is helpful — RoPE outperforms
+learned-absolute on most benchmarks even at matched effective param count.
+
+---
+
+<!-- Next entry (TransformerBlock) appended when it lands. -->

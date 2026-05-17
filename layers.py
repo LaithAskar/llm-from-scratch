@@ -160,6 +160,84 @@ class RMSNorm(nn.Module):
         return (x_f32 * rms).to(orig_dtype) * self.weight
 
 
+class RotaryEmbedding(nn.Module):
+    """
+    Rotary Position Embedding (Su et al., 2021).
+
+    Instead of *adding* a position vector to the token embedding, *rotate*
+    each Q and K vector by a position-dependent angle. The dot product of
+    two rotated vectors depends only on their *relative* position offset
+    (not their absolute positions), which is why RoPE extrapolates better
+    to unseen sequence lengths than learned-absolute pos.
+
+    Convention: half-split (LLaMA / Hugging Face style). Pair element `i`
+    with element `i + head_dim/2`. The first half holds "real" components,
+    the second half "imaginary." Each pair is rotated by `m * inv_freq[i]`
+    where `m` is the position.
+
+    Cached cos/sin tables are non-persistent buffers — they regenerate
+    automatically if you change device or seq len above max_seq_len.
+
+    Call signature: `rope(q, k) -> (q_rotated, k_rotated)`. V is NOT rotated
+    (V carries content, position should only influence attention weights).
+    """
+
+    def __init__(self, head_dim: int, max_seq_len: int, base: float = 10000.0):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError(f"head_dim ({head_dim}) must be even for RoPE")
+        self.head_dim = head_dim
+        # Inverse frequencies: shape (head_dim/2,). Computed in fp32 for
+        # precision — the cached cos/sin are also fp32, downstream matmuls
+        # cast as needed.
+        inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
+        positions = torch.arange(max_seq_len, dtype=torch.float32)
+        # Outer product: (max_seq_len, head_dim/2). Each (m, i) entry is
+        # the angle m * inv_freq[i].
+        freqs = torch.outer(positions, inv_freq)
+        # Non-persistent: regenerate on load instead of bloating checkpoints.
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # q, k expected shape: (B, H, T, D), with D == self.head_dim.
+        T = q.size(-2)
+        if T > self.cos_cached.size(0):
+            raise ValueError(
+                f"sequence length {T} exceeds RoPE max_seq_len {self.cos_cached.size(0)}"
+            )
+        cos = self.cos_cached[:T]  # (T, D/2)
+        sin = self.sin_cached[:T]
+        return _apply_rotary(q, cos, sin), _apply_rotary(k, cos, sin)
+
+
+def _apply_rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+    """
+    Apply rotary embedding to x using cached cos/sin.
+
+    Half-split convention:
+        x = [x1 | x2]  where x1, x2 each have shape (..., D/2)
+        x_rotated = [x1*cos - x2*sin | x1*sin + x2*cos]
+
+    Shapes:
+        x:   (..., T, D)
+        cos: (T, D/2)   — broadcasts against the leading dims of x
+        sin: (T, D/2)
+        out: (..., T, D)
+    """
+    D = x.size(-1)
+    half = D // 2
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    # Cast cos/sin to x's dtype for AMP. The cache is fp32; without this,
+    # PyTorch promotes the whole result to fp32 and you lose AMP's bf16 path.
+    cos_x = cos.to(x.dtype)
+    sin_x = sin.to(x.dtype)
+    out1 = x1 * cos_x - x2 * sin_x
+    out2 = x1 * sin_x + x2 * cos_x
+    return torch.cat((out1, out2), dim=-1)
+
+
 class GeluFFN(nn.Module):
     """
     Classic two-matrix FFN: y = down_proj(GELU(up_proj(x))).
