@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 
-from _dummies import DummyBlock, DummyRMSNorm  # noqa: E402
+from _dummies import DummyBlock  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -24,15 +24,12 @@ def patch_layers(monkeypatch):
     exercised end-to-end. As real implementations land in layers.py, the
     corresponding patch lines come out of this fixture.
 
-    Currently real (not patched): causal_mask.
-    Still stubs (patched here):   RMSNorm, TransformerBlock.
+    Currently real (not patched): causal_mask, RMSNorm.
+    Still stubs (patched here):   TransformerBlock (also pulls MHA via the block).
     """
     import layers
     import model as model_mod
 
     monkeypatch.setattr(layers, "TransformerBlock", DummyBlock)
-    monkeypatch.setattr(layers, "RMSNorm", DummyRMSNorm)
-    # model.py imported these symbols at module-load time; patch its namespace too.
     monkeypatch.setattr(model_mod, "TransformerBlock", DummyBlock)
-    monkeypatch.setattr(model_mod, "RMSNorm", DummyRMSNorm)
     yield

@@ -140,24 +140,17 @@ class RMSNorm(nn.Module):
 
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
-
-        # TODO: store eps. create self.weight as a learnable d-dim parameter
-        # initialized to ones (nn.Parameter(torch.ones(dim))).
-
-        raise NotImplementedError("Implement __init__ for RMSNorm.")
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x shape: (..., dim)
-
-        # TODO: compute mean(x^2) along the last dim, keepdim=True.
-        #       promote to fp32 first if x is fp16/bf16 to keep the mean stable,
-        #       then cast back. (See LLaMA reference impl.)
-
-        # TODO: rms = sqrt(mean_sq + eps), then x_norm = x / rms.
-
-        # TODO: return x_norm * self.weight.
-
-        raise NotImplementedError("Implement forward for RMSNorm.")
+        # Promote to fp32 for the reduction. bf16/fp16 mean-of-squares loses
+        # precision catastrophically across the d_model-sized sum; this is
+        # the standard LLaMA-reference fix.
+        orig_dtype = x.dtype
+        x_f32 = x.to(torch.float32)
+        rms = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        return (x_f32 * rms).to(orig_dtype) * self.weight
 
 
 class TransformerBlock(nn.Module):

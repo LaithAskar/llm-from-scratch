@@ -114,5 +114,162 @@ how the function will be used downstream.
 
 ---
 
-<!-- Next entries (RMSNorm, MultiHeadAttention, GELU FFN, SwiGLU FFN, RoPE,
+## 2. `RMSNorm(dim, eps)`
+
+**File:** `layers.py:142-156`
+**Tests:** `tests/test_layers.py:73-148` (7 cases)
+**Patch status:** real implementation; monkey-patch removed from `conftest.py`.
+
+### Design
+
+Root Mean Square LayerNorm (Zhang & Sennrich, 2019). Drops LayerNorm's
+mean-subtraction and bias term. The per-token computation is:
+
+```
+rms(x) = sqrt(mean(x², axis=-1) + eps)
+y      = (x / rms(x)) * weight
+```
+
+`weight` is a learned per-channel gain of shape `(dim,)` initialized to ones.
+At init this means the forward pass is essentially "rescale each token to
+unit RMS" — the gain only starts to differentiate channels via gradient
+updates.
+
+**Why drop the mean?** Empirically as good or better on transformer LMs
+(LLaMA, PaLM, Mistral all use RMSNorm) and ~30% fewer FLOPs per token
+(no second reduction, no mean-subtraction, no bias add).
+
+**Why per-channel gain (not scalar)?** Different channels of `d_model`
+carry features at different scales. A scalar gain would force the entire
+hidden state to a single post-norm magnitude; per-channel gain lets the
+model amplify channels it cares about.
+
+### Walkthrough
+
+```python
+def __init__(self, dim: int, eps: float = 1e-5):
+    super().__init__()
+    self.eps = eps
+    self.weight = nn.Parameter(torch.ones(dim))
+```
+
+Standard `nn.Module` init. `self.weight` is registered as a learnable
+parameter via `nn.Parameter` — this makes it appear in
+`model.parameters()`, get gradient updates, move with `.to(device)`, and
+serialize in `state_dict`. Init to ones means RMSNorm is *identity gain*
+at step 0; the model only diverges from identity-scale via training.
+
+`eps` is stored as a plain attribute (not a parameter or buffer) because
+it's a constant float, not a tensor to be moved or updated.
+
+```python
+def forward(self, x: torch.Tensor) -> torch.Tensor:
+    orig_dtype = x.dtype
+    x_f32 = x.to(torch.float32)
+    rms = torch.rsqrt(x_f32.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+    return (x_f32 * rms).to(orig_dtype) * self.weight
+```
+
+Five things to defend:
+
+1. **`orig_dtype = x.dtype` + `x.to(torch.float32)`.** This is the
+   load-bearing precision fix. Under AMP (the default in this project,
+   `dtype="bf16"` in `TrainConfig`), inputs arrive as bf16. bf16 has only
+   ~3 decimal digits of mantissa. Computing `x²` and then averaging across
+   `d_model` (e.g. 192-1024 elements) in bf16 produces a mean that's off by
+   several percent, which then propagates through the rsqrt into the output.
+   Promoting to fp32 for the reduction is what LLaMA's reference impl does;
+   skipping this is one of the most common silent-bug RMSNorm
+   implementations. `test_rmsnorm_promotes_bf16_input_to_fp32_for_stability`
+   explicitly fails a naive bf16 implementation.
+
+2. **`x_f32.pow(2).mean(dim=-1, keepdim=True)`.** Mean of squares over the
+   last dim (which is `dim`). `keepdim=True` preserves the dim for clean
+   broadcasting against `x`, so the result is shape `(..., 1)`.
+
+3. **`torch.rsqrt(... + self.eps)`.** `rsqrt(z) = 1/sqrt(z)` as a single
+   fused op. Two reasons to prefer it over `1.0 / torch.sqrt(z)`:
+   (a) fused = one kernel launch instead of two,
+   (b) numerically more stable near small z (the divide and sqrt error
+   compose poorly otherwise). `eps` is added *inside* the sqrt to prevent
+   `rsqrt(0)` blowups on all-zero inputs
+   (`test_rmsnorm_eps_prevents_division_by_zero`).
+
+4. **`(x_f32 * rms).to(orig_dtype)`.** Normalize in fp32, then cast back to
+   the input dtype. After this line the tensor matches the rest of the
+   network's dtype convention.
+
+5. **`* self.weight`.** Per-channel gain applied last, in original dtype.
+   At init weight=1 so this is a no-op; during training it lets the model
+   re-amplify per-channel.
+
+### Interview Qs you should be able to answer
+
+- **Why no bias term?**
+  Two reasons: (a) empirically not load-bearing for transformer LMs (the
+  centered hidden states already have ~zero mean after the residual+norm
+  loops), and (b) the bias was inherited from BatchNorm in the first
+  LayerNorm paper without strong evidence it was necessary in the
+  transformer context. Removing it saves `dim` parameters per norm.
+
+- **Why fp32 for the reduction, when the rest of the model runs in bf16?**
+  bf16's 3-digit mantissa loses precision catastrophically when you sum
+  many squared values across `d_model`. The mean accumulates ~`d_model`
+  rounding errors. fp32 has ~7 digits, which is enough. The cast back to
+  bf16 at the end means downstream ops still get bf16 — only the small
+  internal reduction runs in fp32.
+
+- **Why `rsqrt` instead of `1/sqrt`?**
+  One fused GPU kernel vs two. Also `rsqrt` is intrinsically more stable
+  near small inputs.
+
+- **Why `eps` *inside* the sqrt, not added to `rms` after?**
+  Identical for large `mean_sq`, but on all-zero inputs `mean_sq=0` and
+  `sqrt(0) = 0`, then `1/sqrt(0) = inf`. With `eps` inside: `sqrt(eps)`
+  is small but finite, `rsqrt` gives a large but finite value.
+  `test_rmsnorm_eps_prevents_division_by_zero` is the regression test.
+
+- **What's the difference between RMSNorm and LayerNorm in one sentence?**
+  RMSNorm drops LayerNorm's mean-subtraction and bias; you get unit RMS
+  per token instead of unit variance per token, with one fewer reduction
+  and `dim` fewer parameters.
+
+- **What's the difference between RMSNorm and BatchNorm?**
+  BatchNorm normalizes per-channel *across the batch*. RMSNorm normalizes
+  per-token *across channels*. Batch statistics are unstable at small
+  batches (problem for LMs with long sequences), and BatchNorm requires
+  tracking running statistics for eval. RMSNorm has neither problem.
+
+### Test coverage
+
+`tests/test_layers.py` (7 cases):
+- `test_rmsnorm_preserves_shape` — `(B, T, dim)` in, same out.
+- `test_rmsnorm_weight_is_parameter_of_correct_shape` — `(dim,)` Parameter,
+  init to ones.
+- `test_rmsnorm_output_has_unit_rms_at_init` — per-token RMS of output is
+  ~1 when weight=1, regardless of input scale.
+- `test_rmsnorm_gradient_flows_to_input_and_weight` — both `x.grad` and
+  `weight.grad` populate and are finite.
+- `test_rmsnorm_promotes_bf16_input_to_fp32_for_stability` — the
+  regression test for the fp32-promotion fix. Would fail on naive bf16.
+- `test_rmsnorm_eps_prevents_division_by_zero` — all-zero input gives
+  finite output.
+- `test_rmsnorm_weight_scales_output` — weight=2 produces output 2× weight=1.
+
+Plus the indirect coverage via `test_rmsnorm_branch_selects_rmsnorm` in
+`tests/test_model.py:148-153`, which now asserts `isinstance(lm.final_norm,
+RMSNorm)` against the real implementation (was previously against
+`DummyRMSNorm`).
+
+### Diff vs the stub
+
+The stub had detailed TODO comments specifying every step. No design
+freedom on the core algorithm. The only judgment call was:
+- *Cast back to orig_dtype before or after the weight multiply?* The
+  LLaMA reference casts back *before* weight, so weight*output happens in
+  the model's working dtype. Followed that convention here.
+
+---
+
+<!-- Next entries (MultiHeadAttention, GELU FFN, SwiGLU FFN, RoPE,
      TransformerBlock) appended as components land. -->

@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.nn as nn
 
-from _dummies import DummyRMSNorm
+from layers import RMSNorm
 
 
 # --- Helpers ---------------------------------------------------------------
@@ -85,7 +85,7 @@ def test_rmsnorm_branch_selects_rmsnorm():
 
     cfg = _tiny_config(norm_type="rmsnorm")
     lm = TransformerLM(cfg)
-    assert isinstance(lm.final_norm, DummyRMSNorm)
+    assert isinstance(lm.final_norm, RMSNorm)
 
 
 def test_layernorm_branch_selects_layernorm():
