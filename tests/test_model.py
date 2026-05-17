@@ -138,11 +138,77 @@ def test_generate_shape():
     assert out.shape == (1, 14)
 
 
-def test_generate_truncates_long_context():
+def test_generate_cached_matches_naive_path():
+    """
+    THE end-to-end KV cache correctness test. Generate with cache and
+    generate without cache, starting from the same RNG state, must produce
+    bit-identical output token sequences.
+
+    If this fails, the cache implementation diverges from the recompute
+    path somewhere — wrong position math, mask handling, cache concat
+    order, etc.
+    """
+    from model import TransformerLM
+
+    torch.manual_seed(0)
+    cfg = _tiny_config(context_len=16, dropout=0.0)
+    lm = TransformerLM(cfg)
+    lm.eval()
+
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+
+    torch.manual_seed(42)
+    out_naive = lm.generate(prompt, max_new_tokens=8, temperature=1.0, top_k=10, use_cache=False)
+
+    torch.manual_seed(42)
+    out_cached = lm.generate(prompt, max_new_tokens=8, temperature=1.0, top_k=10, use_cache=True)
+
+    assert torch.equal(out_naive, out_cached), (
+        f"naive: {out_naive.tolist()}, cached: {out_cached.tolist()}"
+    )
+
+
+def test_generate_cached_matches_naive_with_rope():
+    """Same correctness check but with the modern stack (rmsnorm + rope + swiglu)."""
+    from model import TransformerLM
+
+    torch.manual_seed(0)
+    cfg = _tiny_config(
+        context_len=16, dropout=0.0,
+        norm_type="rmsnorm", activation="swiglu", pos_encoding="rope",
+        d_ffn=None,
+    )
+    lm = TransformerLM(cfg)
+    lm.eval()
+
+    prompt = torch.randint(0, cfg.vocab_size, (1, 4))
+
+    torch.manual_seed(42)
+    out_naive = lm.generate(prompt, max_new_tokens=8, temperature=1.0, top_k=10, use_cache=False)
+
+    torch.manual_seed(42)
+    out_cached = lm.generate(prompt, max_new_tokens=8, temperature=1.0, top_k=10, use_cache=True)
+
+    assert torch.equal(out_naive, out_cached), (
+        f"naive: {out_naive.tolist()}, cached: {out_cached.tolist()}"
+    )
+
+
+def test_generate_stops_at_context_limit():
+    """
+    With KV-cache generation (default), once the cache fills to context_len
+    we hard-stop rather than try to slide a window (which would break the
+    learned-position embedding's index range and RoPE's cache range).
+
+    Seed already at max context -> exactly one new token can be generated
+    (from the prefill's last-token logit). The decode loop then exits
+    immediately because cache_len == context_len.
+    """
     from model import TransformerLM
 
     cfg = _tiny_config(context_len=8)
     lm = TransformerLM(cfg)
     seed = torch.randint(0, cfg.vocab_size, (1, 8))  # already at max
     out = lm.generate(seed, max_new_tokens=5)
-    assert out.shape == (1, 13)  # should NOT raise; should truncate internally
+    # 8 seed tokens + 1 sampled from prefill, then context-limit stop.
+    assert out.shape == (1, 9), f"expected (1, 9), got {tuple(out.shape)}"

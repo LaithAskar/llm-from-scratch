@@ -27,6 +27,21 @@ def _make_norm(config: ModelConfig) -> nn.Module:
     return nn.LayerNorm(config.d_model, eps=config.norm_eps, bias=config.bias)
 
 
+def _sample_next(
+    logits: torch.Tensor,        # (B, V)
+    temperature: float,
+    top_k: Optional[int],
+) -> torch.Tensor:                # (B, 1) int64
+    """Apply temperature + optional top-k, then multinomial sample."""
+    logits = logits / max(temperature, 1e-8)
+    if top_k is not None:
+        k = min(top_k, logits.size(-1))
+        v, _ = torch.topk(logits, k)
+        logits = logits.masked_fill(logits < v[:, [-1]], -float("inf"))
+    probs = F.softmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1)
+
+
 class TransformerLM(nn.Module):
     def __init__(self, config: ModelConfig):
         super().__init__()
@@ -127,27 +142,102 @@ class TransformerLM(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        use_cache: bool = True,
     ) -> torch.Tensor:
-        """Naive sampling — no KV cache (that's a Part 3 add-on)."""
+        """
+        Autoregressive sampling.
+
+        use_cache=True (default): prefill the prompt, then decode one token
+            at a time using per-layer KV caches. Each decode step is O(T)
+            instead of O(T²) — for context_len=128 and 100 new tokens,
+            roughly 50x fewer attention FLOPs than recomputing.
+
+        use_cache=False: the naive recompute path. Kept for correctness
+            testing against the cached path.
+        """
         was_training = self.training
         self.eval()
         try:
-            for _ in range(max_new_tokens):
-                idx_cond = (
-                    idx
-                    if idx.size(1) <= self.config.context_len
-                    else idx[:, -self.config.context_len:]
-                )
-                logits, _ = self(idx_cond)
-                logits = logits[:, -1, :] / max(temperature, 1e-8)
-                if top_k is not None:
-                    k = min(top_k, logits.size(-1))
-                    v, _ = torch.topk(logits, k)
-                    logits[logits < v[:, [-1]]] = -float("inf")
-                probs = F.softmax(logits, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
-                idx = torch.cat((idx, next_id), dim=1)
+            if not use_cache:
+                return self._generate_naive(idx, max_new_tokens, temperature, top_k)
+            return self._generate_cached(idx, max_new_tokens, temperature, top_k)
         finally:
             if was_training:
                 self.train()
+
+    def _generate_naive(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: Optional[int],
+    ) -> torch.Tensor:
+        for _ in range(max_new_tokens):
+            idx_cond = (
+                idx if idx.size(1) <= self.config.context_len
+                else idx[:, -self.config.context_len:]
+            )
+            logits, _ = self(idx_cond)
+            next_id = _sample_next(logits[:, -1, :], temperature, top_k)
+            idx = torch.cat((idx, next_id), dim=1)
+        return idx
+
+    def _generate_cached(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float,
+        top_k: Optional[int],
+    ) -> torch.Tensor:
+        # Truncate prompt to context window (same convention as naive path).
+        if idx.size(1) > self.config.context_len:
+            idx = idx[:, -self.config.context_len:]
+
+        # Empty caches, one per block. {} becomes {"k": ..., "v": ...} after
+        # each block's first call.
+        caches: list[dict] = [{} for _ in self.blocks]
+
+        # === Prefill: process the whole prompt, populate caches. ===
+        T_prompt = idx.size(1)
+        h = self.tok_emb(idx)
+        if self.pos_emb is not None:
+            pos = torch.arange(T_prompt, device=idx.device)
+            h = h + self.pos_emb(pos)
+        h = self.drop(h)
+
+        mask = self._causal_mask[:T_prompt, :T_prompt]
+        for i, block in enumerate(self.blocks):
+            h, caches[i] = block(h, mask=mask, kv_cache=caches[i])
+
+        # Get logits for the last prompt token and sample the first new token.
+        h_last = self.final_norm(h[:, -1:, :])
+        logits = self.lm_head(h_last)[:, -1, :]
+        next_id = _sample_next(logits, temperature, top_k)
+        idx = torch.cat((idx, next_id), dim=1)
+
+        # === Decode loop: one new token at a time, using caches. ===
+        for _ in range(max_new_tokens - 1):
+            # Stop early if we've already hit the context limit — RoPE and
+            # the position embedding would index out of range.
+            current_len = caches[0]["k"].size(-2)
+            if current_len >= self.config.context_len:
+                break
+
+            new_x = self.tok_emb(next_id)  # (B, 1, C)
+            if self.pos_emb is not None:
+                # New token's position = current cache length.
+                pos = torch.tensor([current_len], device=idx.device)
+                new_x = new_x + self.pos_emb(pos)
+            new_x = self.drop(new_x)
+
+            # No mask during decode — single new token attends to all of history
+            # by construction (no future to mask).
+            for i, block in enumerate(self.blocks):
+                new_x, caches[i] = block(new_x, mask=None, kv_cache=caches[i])
+
+            h_last = self.final_norm(new_x)
+            logits = self.lm_head(h_last)[:, -1, :]
+            next_id = _sample_next(logits, temperature, top_k)
+            idx = torch.cat((idx, next_id), dim=1)
+
         return idx

@@ -36,9 +36,15 @@ from train import train
 
 
 def base_model_config() -> ModelConfig:
+    """
+    Toy-scale config: ~1M non-embedding params (7M total with the 50257 vocab
+    embedding). Sized so the full 5-variant × 3-seed ablation fits in ~1-2 h
+    on an 8 GB laptop GPU, and so the downstream pieces (SFT, RM, PPO) have
+    comfortable VRAM headroom for 2x-model-in-memory training.
+    """
     return ModelConfig(
         vocab_size=50257,
-        n_layer=4, n_head=6, d_model=192, context_len=256,
+        n_layer=3, n_head=4, d_model=128, context_len=128,
         dropout=0.1, bias=False,
         norm_type="layernorm", activation="gelu", pos_encoding="learned",
     )
@@ -47,9 +53,9 @@ def base_model_config() -> ModelConfig:
 def base_train_config() -> TrainConfig:
     return TrainConfig(
         lr=3e-4, min_lr=3e-5, weight_decay=0.1,
-        micro_batch_size=16, grad_accum_steps=2,
-        max_steps=5000, warmup_steps=200,
-        eval_every=250, eval_iters=50, ckpt_every=2500, log_every=20,
+        micro_batch_size=8, grad_accum_steps=2,
+        max_steps=2000, warmup_steps=100,
+        eval_every=200, eval_iters=20, ckpt_every=1000, log_every=20,
         dtype="bf16", compile=False,
     )
 

@@ -76,40 +76,62 @@ class MultiHeadAttention(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        kv_cache: Optional[dict] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
+        """
+        kv_cache: optional inference-time cache.
+          - None  -> training / non-cached path; returns tensor only.
+          - dict (possibly empty, possibly populated with "k" and "v") ->
+            cached path; returns (out, updated_cache).
+
+        Cached path semantics:
+          - If kv_cache is empty: prefill mode. x is the full prompt.
+          - If kv_cache has "k"/"v": decode mode. x is typically (B, 1, C);
+            the new K/V are concatenated to the cached history before scoring.
+
+        The caller is responsible for mask shape — during prefill, pass a
+        (T_prompt, T_prompt) causal mask; during decode, pass None (single
+        new token can attend to all history by construction).
+        """
         B, T, C = x.shape
         H, D = self.num_heads, self.head_dim
 
-        # Project and split into heads in one expression per tensor.
-        # view(B, T, H, D) puts heads on a new axis; transpose(1, 2) moves
-        # heads in front of time so attention is a batched per-head matmul.
         q = self.q_proj(x).view(B, T, H, D).transpose(1, 2)  # (B, H, T, D)
         k = self.k_proj(x).view(B, T, H, D).transpose(1, 2)
         v = self.v_proj(x).view(B, T, H, D).transpose(1, 2)
 
-        if self.rotary is not None:
-            q, k = self.rotary(q, k)
+        # Position offset for RoPE: how many tokens are already in the cache.
+        # 0 in the non-cached or prefill-with-empty-cache case.
+        pos_offset = 0
+        if kv_cache is not None and "k" in kv_cache:
+            pos_offset = kv_cache["k"].size(-2)
 
-        # Scaled dot-product scores. (B, H, T, D) @ (B, H, D, T) -> (B, H, T, T).
+        if self.rotary is not None:
+            q, k = self.rotary(q, k, position_offset=pos_offset)
+
+        # Concat with cached K/V if any. Store ALREADY-ROTATED K so we don't
+        # re-rotate on future calls.
+        if kv_cache is not None:
+            if "k" in kv_cache:
+                k = torch.cat([kv_cache["k"], k], dim=-2)
+                v = torch.cat([kv_cache["v"], v], dim=-2)
+            new_kv_cache = {"k": k, "v": v}
+
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(D)
 
         if mask is not None:
-            # Convention: mask True == attend, False == mask out (project
-            # convention, set by causal_mask). masked_fill writes where the
-            # predicate is True, so we invert.
-            # Shape (T, T) bool broadcasts across (B, H) automatically.
             scores = scores.masked_fill(~mask, float("-inf"))
 
         attn = F.softmax(scores, dim=-1)
         attn = self.attn_dropout(attn)
 
-        # (B, H, T, T) @ (B, H, T, D) -> (B, H, T, D).
         out = attn @ v
-
-        # Merge heads back: transpose breaks contiguity, so .contiguous()
-        # before view() to avoid a stride error.
         out = out.transpose(1, 2).contiguous().view(B, T, C)
-        return self.out_proj(out)
+        out = self.out_proj(out)
+
+        if kv_cache is not None:
+            return out, new_kv_cache
+        return out
 
 
 def causal_mask(seq_len: int, device: Optional[torch.device] = None) -> torch.Tensor:
@@ -199,15 +221,24 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        position_offset: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # q, k expected shape: (B, H, T, D), with D == self.head_dim.
+        # position_offset: starting position for these tokens. 0 for the
+        # normal training/forward case. >0 during cached generation, where
+        # the new tokens sit at positions [cache_len, cache_len+T).
         T = q.size(-2)
-        if T > self.cos_cached.size(0):
+        end = position_offset + T
+        if end > self.cos_cached.size(0):
             raise ValueError(
-                f"sequence length {T} exceeds RoPE max_seq_len {self.cos_cached.size(0)}"
+                f"position {end} exceeds RoPE max_seq_len {self.cos_cached.size(0)}"
             )
-        cos = self.cos_cached[:T]  # (T, D/2)
-        sin = self.sin_cached[:T]
+        cos = self.cos_cached[position_offset:end]  # (T, D/2)
+        sin = self.sin_cached[position_offset:end]
         return _apply_rotary(q, cos, sin), _apply_rotary(k, cos, sin)
 
 
@@ -367,13 +398,20 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        kv_cache: Optional[dict] = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, dict]:
         # Pre-norm: residual stream stays a clean identity path; norms sit
         # *inside* each sublayer branch (Xiong et al. 2020). Empirically
         # stable at depth without warmup gymnastics.
-        h = x + self.attn(self.norm1(x), mask=mask)
-        h = h + self.ffn(self.norm2(h))
-        return h
+        if kv_cache is None:
+            h = x + self.attn(self.norm1(x), mask=mask)
+            h = h + self.ffn(self.norm2(h))
+            return h
+        else:
+            attn_out, new_kv = self.attn(self.norm1(x), mask=mask, kv_cache=kv_cache)
+            h = x + attn_out
+            h = h + self.ffn(self.norm2(h))
+            return h, new_kv
 
 
 if __name__ == "__main__":

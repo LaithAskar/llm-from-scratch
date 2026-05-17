@@ -1046,3 +1046,175 @@ stack.
   for a short smoke run that produces a real `summary.csv`.
 - Plotting / analysis script over `summary.csv` once seeds finish.
 - README with honest authorship attribution (separately tracked).
+
+---
+
+## 8. KV cache (Part 3* — inference optimization)
+
+**Files modified:**
+- `layers.py:RotaryEmbedding.forward` — added `position_offset` arg.
+- `layers.py:MultiHeadAttention.forward` — added optional `kv_cache` dict;
+  conditional tuple return.
+- `layers.py:TransformerBlock.forward` — added optional `kv_cache`; passes through.
+- `model.py:TransformerLM.generate` — rewritten as prefill-then-decode with
+  `use_cache=True` (default). `use_cache=False` keeps the recompute path
+  for correctness testing.
+- `model.py:_sample_next` — new module-level helper used by both generate paths.
+
+**Tests:** `tests/test_layers.py` (+7 cases), `tests/test_model.py` (+2 cases).
+Total 85 passing.
+
+### Design
+
+KV cache is a *generation-time* optimization. During autoregressive
+sampling, every new token needs to attend to all previous K and V. Without
+caching, each step recomputes K and V from scratch for the entire history
+— O(T²) attention FLOPs across T new tokens. With caching, we store K and
+V from past steps and only project the new token — O(T) per step.
+
+For 100 generated tokens at context_len=128: ~50× fewer attention FLOPs.
+
+**Why it's training-neutral.** The cache only activates when `kv_cache` is
+passed to MHA/Block. Default is `None`, so training (which calls `forward`
+without cache) is unchanged. Same code path, same gradients, same losses.
+
+### API choices
+
+1. **Conditional return type on MHA/Block.** When `kv_cache=None`, return
+   just the output tensor (existing API preserved). When `kv_cache` is a
+   dict, return `(out, updated_cache)`. The alternative — always returning
+   a tuple — would churn every existing caller; the conditional shape is
+   documented in the docstring.
+
+2. **Empty `{}` means "prefill mode."** Caller passes `kv_cache={}` for the
+   first call (prompt processing). MHA distinguishes "fresh cache" vs
+   "populated cache" by checking `"k" in kv_cache`.
+
+3. **Store ALREADY-ROTATED K in the cache.** When RoPE is active, K is
+   rotated by its position angle before going into the cache. On the next
+   step, the cached K isn't re-rotated — it's already correctly positioned.
+   New K gets rotated using `position_offset=cache_length`.
+
+4. **Hard-stop at `context_len` instead of sliding the window.** When the
+   cache fills to `context_len`, `generate` returns the tokens it has
+   rather than evicting old cache entries. Sliding would break
+   learned-absolute position embeddings (positions would exceed
+   `context_len`) and RoPE (cached angles would be wrong post-eviction).
+   Sliding-window generation is a real technique but adds complexity
+   disproportionate to a toy LLM.
+
+### Walkthrough — `MultiHeadAttention.forward` with cache
+
+```python
+pos_offset = 0
+if kv_cache is not None and "k" in kv_cache:
+    pos_offset = kv_cache["k"].size(-2)
+
+if self.rotary is not None:
+    q, k = self.rotary(q, k, position_offset=pos_offset)
+```
+
+Determine where the new tokens sit in absolute position space. On first
+call (empty cache), they start at 0. On the Nth decode step (cache has N
+already-rotated tokens), they start at N.
+
+```python
+if kv_cache is not None:
+    if "k" in kv_cache:
+        k = torch.cat([kv_cache["k"], k], dim=-2)
+        v = torch.cat([kv_cache["v"], v], dim=-2)
+    new_kv_cache = {"k": k, "v": v}
+```
+
+Concat new K/V onto history. The score matmul then has shape
+`(B, H, T_new, T_total)` because k has T_total tokens but q only has T_new.
+
+### Walkthrough — `TransformerLM._generate_cached`
+
+```python
+caches: list[dict] = [{} for _ in self.blocks]
+
+# Prefill
+h = self.tok_emb(idx) + (pos_emb if learned else 0)
+for i, block in enumerate(self.blocks):
+    h, caches[i] = block(h, mask=mask, kv_cache=caches[i])
+next_id = sample(self.final_norm(h[:, -1:, :]))
+
+# Decode loop
+for _ in range(max_new_tokens - 1):
+    if caches[0]["k"].size(-2) >= context_len: break
+    new_x = self.tok_emb(next_id) + pos_emb_at_current_length
+    for i, block in enumerate(self.blocks):
+        new_x, caches[i] = block(new_x, mask=None, kv_cache=caches[i])
+    next_id = sample(self.final_norm(new_x))
+```
+
+Two key tricks:
+- **Sample first token from prefill's last position.** Prefill computes
+  hidden states for every prompt position; we only need the last to
+  predict the next token.
+- **No mask during decode.** Single new token (T_q=1) attends to all of
+  history; masking would be a no-op anyway.
+
+### Interview Qs you should be able to answer
+
+- **Why is KV cache only useful at generation time, not training?**
+  Training does a single parallel forward over the whole sequence — each
+  position's K, V is computed once and used once, in parallel. There's no
+  reuse across steps to cache. Generation is autoregressive: every new
+  step re-attends to all previous K and V; without cache, those get
+  re-projected from the embedding stream each time.
+
+- **Why don't we cache the queries?**
+  Q for position N is used only at the attention step at position N. K
+  and V from position N are read by every step after N. Cache is only
+  useful for tensors that are *read across multiple decoder steps.*
+
+- **What's the memory cost of the KV cache?**
+  Per layer: `2 (K and V) * B * H * T * D * bytes`. Toy scale
+  (`B=1, H=4, T=128, D=32, bf16`): 64 KB per layer per batch — negligible.
+  GPT-3 scale (`H=96, T=2048, D=128, n_layer=96, bf16`): ~9 GB per batch.
+  This is why long-context inference is memory-bound, not compute-bound.
+
+- **Why does the cached path's first call need a causal mask but subsequent
+  calls don't?**
+  Prefill processes the full prompt in one forward — all prompt positions
+  exist in the same q tensor, so the causal mask prevents each from
+  peeking at later prompt positions. Decode calls have only one new
+  position; T_q=1 against T_kv=T_total broadcasts to "attend to
+  everything," which is correct because everything in the cache is "the
+  past" from the new token's perspective.
+
+- **What does sliding-window or rolling KV cache do, and why didn't we
+  implement it?**
+  Slide the cache: evict oldest entries when adding new ones, so
+  generation can continue past context_len indefinitely. Used in streaming
+  chat. Not done here because (a) it adds significant complexity
+  (eviction logic, position-index translation for learned-abs pos, RoPE
+  cache index translation), (b) for a toy LLM the test cases don't need
+  it, and (c) the alternative — "you ran out of context, stop" — is
+  honest and explicit.
+
+### Test coverage
+
+`tests/test_layers.py` (+7):
+- `test_rope_position_offset_equals_absolute_position`
+- **`test_mha_cached_prefill_plus_decode_equals_full`** — bit-equality
+- `test_mha_cached_decode_step_by_step_equals_full`
+- `test_mha_cached_with_rope_equals_full`
+- `test_block_cached_equals_full`
+- `test_block_cached_with_rope_equals_full`
+- `test_block_cached_with_rmsnorm_swiglu_modern_stack_equals_full`
+
+`tests/test_model.py` (+2):
+- **`test_generate_cached_matches_naive_path`** — `generate(use_cache=True)`
+  and `generate(use_cache=False)` produce bit-identical token sequences
+  given the same RNG seed. End-to-end correctness gate.
+- `test_generate_cached_matches_naive_with_rope` — same with modern stack.
+
+### Side-effect on prior test
+
+`test_generate_stops_at_context_limit` (formerly
+`test_generate_truncates_long_context`) was updated. The old naive path
+silently slid a context window and kept appending; the new cached path
+hard-stops when the cache fills. Honest API > quietly-degrading API.

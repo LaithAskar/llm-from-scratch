@@ -252,32 +252,188 @@ def test_mha_dropout_is_noop_in_eval_mode():
 def test_mha_calls_rotary_hook_if_provided():
     # If a rotary callable is passed, it should be applied to q and k
     # before the attention matmul. A no-op rotary should give identical
-    # output to no rotary.
+    # output to no rotary. Rotary contract: callable(q, k, position_offset=int).
     torch.manual_seed(0)
     x = torch.randn(1, 4, 16)
 
     mha_no_rope = MultiHeadAttention(embed_dim=16, num_heads=4)
     mha_no_rope.eval()
     mha_noop_rope = MultiHeadAttention(
-        embed_dim=16, num_heads=4, rotary=lambda q, k: (q, k)
+        embed_dim=16, num_heads=4, rotary=lambda q, k, position_offset=0: (q, k)
     )
     mha_noop_rope.eval()
-    # Copy weights so the comparison is fair.
     mha_noop_rope.load_state_dict(mha_no_rope.state_dict())
 
     out1 = mha_no_rope(x)
     out2 = mha_noop_rope(x)
     assert torch.allclose(out1, out2, atol=1e-6)
 
-    # A rotary that scales q and k uniformly should still produce a valid
-    # output shape (just exercises the call path).
     mha_scaled = MultiHeadAttention(
-        embed_dim=16, num_heads=4, rotary=lambda q, k: (q * 0.5, k * 0.5)
+        embed_dim=16, num_heads=4,
+        rotary=lambda q, k, position_offset=0: (q * 0.5, k * 0.5),
     )
     mha_scaled.eval()
     mha_scaled.load_state_dict(mha_no_rope.state_dict())
     out3 = mha_scaled(x)
     assert out3.shape == x.shape
+
+
+# --- KV cache (MHA + Block + RoPE-offset) ----------------------------------
+
+
+def test_rope_position_offset_equals_absolute_position():
+    """
+    Rotating a single token at position_offset=N must equal rotating the
+    same token if it had appeared at index N in a longer sequence (where
+    the rotation is computed without offset).
+    """
+    torch.manual_seed(0)
+    rope = RotaryEmbedding(head_dim=8, max_seq_len=16)
+    q = torch.randn(1, 1, 1, 8)
+    k = torch.randn(1, 1, 1, 8)
+
+    # Path A: rotate with offset=5 (treat the single token as at position 5)
+    q_off, k_off = rope(q, k, position_offset=5)
+
+    # Path B: build a 6-token sequence with q, k at position 5, rotate
+    # without offset, extract position 5
+    q_full = torch.zeros(1, 1, 6, 8)
+    k_full = torch.zeros(1, 1, 6, 8)
+    q_full[:, :, 5:6] = q
+    k_full[:, :, 5:6] = k
+    q_full_rot, k_full_rot = rope(q_full, k_full)
+
+    assert torch.allclose(q_off[:, :, 0], q_full_rot[:, :, 5], atol=1e-6)
+    assert torch.allclose(k_off[:, :, 0], k_full_rot[:, :, 5], atol=1e-6)
+
+
+def test_mha_cached_prefill_plus_decode_equals_full():
+    """
+    THE correctness test for KV cache. A prefill on the first N-1 tokens
+    plus a single-token decode on the Nth must produce the same output as
+    a single full forward over all N tokens.
+
+    If this fails, KV cache is wrong somewhere: position math, cache
+    concatenation, mask handling, or RoPE offset.
+    """
+    torch.manual_seed(0)
+    mha = MultiHeadAttention(embed_dim=16, num_heads=4)
+    mha.eval()
+
+    x = torch.randn(1, 5, 16)
+
+    # Path A: one full forward with causal mask
+    full_out = mha(x, mask=causal_mask(5))
+
+    # Path B: prefill first 4 tokens with cache, then decode 5th
+    cache: dict = {}
+    prefill_out, cache = mha(x[:, :4], mask=causal_mask(4), kv_cache=cache)
+    decode_out, cache = mha(x[:, 4:5], mask=None, kv_cache=cache)
+
+    cached_out = torch.cat([prefill_out, decode_out], dim=1)
+
+    assert torch.allclose(full_out, cached_out, atol=1e-5), (
+        f"max diff: {(full_out - cached_out).abs().max().item():.6f}"
+    )
+
+
+def test_mha_cached_decode_step_by_step_equals_full():
+    """
+    Stress version: decode one token at a time from an empty cache. The
+    concatenated outputs must equal a single full forward.
+    """
+    torch.manual_seed(0)
+    mha = MultiHeadAttention(embed_dim=16, num_heads=4)
+    mha.eval()
+    x = torch.randn(1, 6, 16)
+
+    full_out = mha(x, mask=causal_mask(6))
+
+    cache: dict = {}
+    pieces = []
+    for t in range(6):
+        # Each step is a single-token forward; mask must be None
+        # (single new token, no future to mask).
+        out, cache = mha(x[:, t:t + 1], mask=None, kv_cache=cache)
+        pieces.append(out)
+    cached_out = torch.cat(pieces, dim=1)
+
+    assert torch.allclose(full_out, cached_out, atol=1e-5)
+
+
+def test_mha_cached_with_rope_equals_full():
+    """Same correctness check but with RoPE active. Verifies position_offset
+    plumbing through MHA."""
+    torch.manual_seed(0)
+    rope = RotaryEmbedding(head_dim=4, max_seq_len=16)
+    mha = MultiHeadAttention(embed_dim=16, num_heads=4, rotary=rope)
+    mha.eval()
+    x = torch.randn(1, 5, 16)
+
+    full_out = mha(x, mask=causal_mask(5))
+
+    cache: dict = {}
+    prefill_out, cache = mha(x[:, :3], mask=causal_mask(3), kv_cache=cache)
+    step1_out, cache = mha(x[:, 3:4], mask=None, kv_cache=cache)
+    step2_out, cache = mha(x[:, 4:5], mask=None, kv_cache=cache)
+    cached_out = torch.cat([prefill_out, step1_out, step2_out], dim=1)
+
+    assert torch.allclose(full_out, cached_out, atol=1e-5)
+
+
+def test_block_cached_equals_full():
+    """Block-level: cached prefill+decode equals full forward (no RoPE)."""
+    cfg = _tiny_block_config()
+    block = TransformerBlock(cfg)
+    block.eval()
+    x = torch.randn(1, 5, cfg.d_model)
+
+    full_out = block(x, mask=causal_mask(5))
+
+    cache: dict = {}
+    prefill_out, cache = block(x[:, :4], mask=causal_mask(4), kv_cache=cache)
+    decode_out, cache = block(x[:, 4:5], mask=None, kv_cache=cache)
+    cached_out = torch.cat([prefill_out, decode_out], dim=1)
+
+    assert torch.allclose(full_out, cached_out, atol=1e-5)
+
+
+def test_block_cached_with_rope_equals_full():
+    """Block-level: cached prefill+decode equals full forward WITH RoPE."""
+    cfg = _tiny_block_config(pos_encoding="rope")
+    block = TransformerBlock(cfg)
+    block.eval()
+    x = torch.randn(1, 5, cfg.d_model)
+
+    full_out = block(x, mask=causal_mask(5))
+
+    cache: dict = {}
+    prefill_out, cache = block(x[:, :4], mask=causal_mask(4), kv_cache=cache)
+    decode_out, cache = block(x[:, 4:5], mask=None, kv_cache=cache)
+    cached_out = torch.cat([prefill_out, decode_out], dim=1)
+
+    assert torch.allclose(full_out, cached_out, atol=1e-5)
+
+
+def test_block_cached_with_rmsnorm_swiglu_modern_stack_equals_full():
+    """The 'modern' variant stack (rmsnorm + swiglu + rope) with cache."""
+    cfg = _tiny_block_config(
+        norm_type="rmsnorm", activation="swiglu", pos_encoding="rope",
+        d_ffn=None,
+    )
+    block = TransformerBlock(cfg)
+    block.eval()
+    x = torch.randn(1, 4, cfg.d_model)
+
+    full_out = block(x, mask=causal_mask(4))
+
+    cache: dict = {}
+    prefill_out, cache = block(x[:, :2], mask=causal_mask(2), kv_cache=cache)
+    s1, cache = block(x[:, 2:3], mask=None, kv_cache=cache)
+    s2, cache = block(x[:, 3:4], mask=None, kv_cache=cache)
+    cached_out = torch.cat([prefill_out, s1, s2], dim=1)
+
+    assert torch.allclose(full_out, cached_out, atol=1e-5)
 
 
 # --- GeluFFN ---------------------------------------------------------------
