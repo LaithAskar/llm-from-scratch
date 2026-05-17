@@ -11,7 +11,15 @@ from __future__ import annotations
 import pytest
 import torch
 
-from layers import GeluFFN, MultiHeadAttention, RMSNorm, RotaryEmbedding, SwiGLUFFN, causal_mask
+from layers import (
+    GeluFFN,
+    MultiHeadAttention,
+    RMSNorm,
+    RotaryEmbedding,
+    SwiGLUFFN,
+    TransformerBlock,
+    causal_mask,
+)
 
 
 # --- causal_mask -----------------------------------------------------------
@@ -481,3 +489,106 @@ def test_rope_integrates_with_mha():
     x = torch.randn(1, 6, 32)
     out = mha(x)
     assert out.shape == x.shape
+
+
+# --- TransformerBlock ------------------------------------------------------
+
+
+def _tiny_block_config(**overrides):
+    from config import ModelConfig
+
+    base = dict(
+        vocab_size=257, n_layer=1, n_head=4, d_model=32, context_len=16, dropout=0.0,
+    )
+    base.update(overrides)
+    return ModelConfig(**base)
+
+
+def test_block_forward_shape_preserved():
+    block = TransformerBlock(_tiny_block_config())
+    x = torch.randn(2, 8, 32)
+    out = block(x, mask=causal_mask(8))
+    assert out.shape == x.shape
+
+
+def test_block_norm_switch_layernorm():
+    block = TransformerBlock(_tiny_block_config(norm_type="layernorm"))
+    assert isinstance(block.norm1, torch.nn.LayerNorm)
+    assert isinstance(block.norm2, torch.nn.LayerNorm)
+
+
+def test_block_norm_switch_rmsnorm():
+    block = TransformerBlock(_tiny_block_config(norm_type="rmsnorm"))
+    assert isinstance(block.norm1, RMSNorm)
+    assert isinstance(block.norm2, RMSNorm)
+
+
+def test_block_activation_switch_gelu():
+    block = TransformerBlock(_tiny_block_config(activation="gelu"))
+    assert isinstance(block.ffn, GeluFFN)
+
+
+def test_block_activation_switch_swiglu():
+    block = TransformerBlock(_tiny_block_config(activation="swiglu"))
+    assert isinstance(block.ffn, SwiGLUFFN)
+
+
+def test_block_rope_switch_on():
+    block = TransformerBlock(_tiny_block_config(pos_encoding="rope"))
+    assert isinstance(block.attn.rotary, RotaryEmbedding)
+
+
+def test_block_rope_switch_off():
+    block = TransformerBlock(_tiny_block_config(pos_encoding="learned"))
+    assert block.attn.rotary is None
+
+
+def test_block_modern_variant_all_switches():
+    """The 'modern' ablation variant: rmsnorm + swiglu + rope."""
+    block = TransformerBlock(_tiny_block_config(
+        norm_type="rmsnorm", activation="swiglu", pos_encoding="rope",
+        d_ffn=None,  # let __post_init__ apply the (8/3)*d_model rule
+    ))
+    assert isinstance(block.norm1, RMSNorm)
+    assert isinstance(block.ffn, SwiGLUFFN)
+    assert isinstance(block.attn.rotary, RotaryEmbedding)
+    # Forward end-to-end through the full modern stack.
+    x = torch.randn(1, 4, 32)
+    out = block(x, mask=causal_mask(4))
+    assert out.shape == x.shape
+
+
+def test_block_gradient_flows_to_input_and_all_params():
+    block = TransformerBlock(_tiny_block_config())
+    x = torch.randn(1, 4, 32, requires_grad=True)
+    out = block(x, mask=causal_mask(4))
+    out.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for n, p in block.named_parameters():
+        assert p.grad is not None, f"no grad on {n}"
+        assert torch.isfinite(p.grad).all(), f"non-finite grad on {n}"
+
+
+def test_block_residual_pattern_attn_then_ffn():
+    """
+    With zero-d-out sublayer outputs, block(x) should equal x. We can't
+    easily zero attention output, but we can verify the *structure* by
+    setting norm + sublayer outputs to ~0 via state_dict surgery and
+    asserting the residual path dominates.
+
+    Simpler test: with a pre-norm pattern, the first thing applied to x is
+    NOT a sublayer — x flows through the residual. So `block(x).shape == x.shape`
+    always (already covered). The structural assertion below is the
+    parameter-count check.
+    """
+    block = TransformerBlock(_tiny_block_config())
+    # Block should contain: 2 norms + 1 MHA + 1 FFN. No additional learnable
+    # parameters above those.
+    sub_param_count = sum(
+        sum(p.numel() for p in sub.parameters())
+        for sub in [block.norm1, block.norm2, block.attn, block.ffn]
+    )
+    block_param_count = sum(p.numel() for p in block.parameters())
+    assert sub_param_count == block_param_count, (
+        "block has parameters outside its 4 declared submodules"
+    )

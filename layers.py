@@ -320,23 +320,60 @@ class TransformerBlock(nn.Module):
     def __init__(self, config):  # config: ModelConfig — avoiding circular import in type hint
         super().__init__()
 
-        # TODO: build self.norm1, self.attn, self.norm2, self.ffn.
-        # TODO: switch on config.norm_type to pick LayerNorm or RMSNorm.
-        # TODO: switch on config.activation to pick the FFN variant.
-        # TODO: pass config.pos_encoding to MHA if you handle RoPE inside it.
+        # Norm picker (used twice — once before attn, once before ffn).
+        def make_norm():
+            if config.norm_type == "rmsnorm":
+                return RMSNorm(config.d_model, eps=config.norm_eps)
+            return nn.LayerNorm(config.d_model, eps=config.norm_eps, bias=config.bias)
 
-        raise NotImplementedError("Implement __init__ for TransformerBlock.")
+        self.norm1 = make_norm()
+        self.norm2 = make_norm()
+
+        # Optional RoPE — handed to MHA as its `rotary` callable. None for
+        # learned-absolute pos (handled at the LM embedding level in model.py).
+        rotary: Optional[RotaryEmbedding] = None
+        if config.pos_encoding == "rope":
+            rotary = RotaryEmbedding(
+                head_dim=config.head_dim,
+                max_seq_len=config.context_len,
+                base=config.rope_base,
+            )
+
+        self.attn = MultiHeadAttention(
+            embed_dim=config.d_model,
+            num_heads=config.n_head,
+            dropout=config.dropout,
+            bias=config.bias,
+            rotary=rotary,
+        )
+
+        # FFN picker.
+        if config.activation == "swiglu":
+            self.ffn = SwiGLUFFN(
+                d_model=config.d_model,
+                d_ffn=config.d_ffn,
+                bias=config.bias,
+                dropout=config.dropout,
+            )
+        else:
+            self.ffn = GeluFFN(
+                d_model=config.d_model,
+                d_ffn=config.d_ffn,
+                bias=config.bias,
+                dropout=config.dropout,
+            )
 
     def forward(
         self,
         x: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # TODO: pre-norm + residual for attention.
-        # TODO: pre-norm + residual for FFN.
-        # TODO: return.
-
-        raise NotImplementedError("Implement forward for TransformerBlock.")
+        # Pre-norm: residual stream stays a clean identity path; norms sit
+        # *inside* each sublayer branch (Xiong et al. 2020). Empirically
+        # stable at depth without warmup gymnastics.
+        h = x + self.attn(self.norm1(x), mask=mask)
+        h = h + self.ffn(self.norm2(h))
+        return h
 
 
 if __name__ == "__main__":

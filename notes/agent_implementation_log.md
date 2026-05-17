@@ -855,4 +855,194 @@ learned-absolute on most benchmarks even at matched effective param count.
 
 ---
 
-<!-- Next entry (TransformerBlock) appended when it lands. -->
+## 7. `TransformerBlock(config)`
+
+**File:** `layers.py:281-340`
+**Tests:** `tests/test_layers.py:495-595` (10 cases)
+**Patch status:** real implementation; **`DummyBlock` patch fully removed**
+from `conftest.py`. All 28 model/train/eval/ablation tests now exercise the
+real layers end-to-end.
+
+### Design
+
+The plumbing block. Wires norm + attn + norm + ffn into the standard
+pre-norm pattern, with all architectural switches read from `config`:
+
+- `config.norm_type`: `LayerNorm` or `RMSNorm` for both norms.
+- `config.activation`: `GeluFFN` or `SwiGLUFFN` for the FFN.
+- `config.pos_encoding`: `RotaryEmbedding` constructed and handed to MHA
+  via the `rotary=` hook (vs `None` for learned-absolute, handled in
+  `model.py` at the embedding level).
+
+This is exactly the layer of indirection the ablation needs: flip one
+config field, swap one component, every other variable held constant.
+
+### Walkthrough
+
+```python
+def __init__(self, config):
+    super().__init__()
+
+    def make_norm():
+        if config.norm_type == "rmsnorm":
+            return RMSNorm(config.d_model, eps=config.norm_eps)
+        return nn.LayerNorm(config.d_model, eps=config.norm_eps, bias=config.bias)
+
+    self.norm1 = make_norm()
+    self.norm2 = make_norm()
+```
+
+A nested `make_norm` closure builds the right norm type — used twice (once
+before attention, once before the FFN). Could have been a free function;
+nested gives it private scope and prevents accidental reuse outside the
+block. `nn.LayerNorm`'s `bias` argument was added in PyTorch 2.1.
+
+```python
+    rotary = None
+    if config.pos_encoding == "rope":
+        rotary = RotaryEmbedding(
+            head_dim=config.head_dim,
+            max_seq_len=config.context_len,
+            base=config.rope_base,
+        )
+```
+
+Construct RoPE only if needed. **Key choice:** `max_seq_len = config.context_len`,
+not larger. RoPE's cache size is `O(max_seq_len * head_dim)` — sizing it
+beyond what the model can process is wasted memory. `context_len` is the
+right ceiling.
+
+```python
+    self.attn = MultiHeadAttention(
+        embed_dim=config.d_model,
+        num_heads=config.n_head,
+        dropout=config.dropout,
+        bias=config.bias,
+        rotary=rotary,
+    )
+```
+
+Build the attention sublayer with all switches plumbed through.
+
+```python
+    if config.activation == "swiglu":
+        self.ffn = SwiGLUFFN(
+            d_model=config.d_model, d_ffn=config.d_ffn,
+            bias=config.bias, dropout=config.dropout,
+        )
+    else:
+        self.ffn = GeluFFN(
+            d_model=config.d_model, d_ffn=config.d_ffn,
+            bias=config.bias, dropout=config.dropout,
+        )
+```
+
+FFN picker. `config.d_ffn` was resolved at config-construction time —
+`(8/3) * d_model` for SwiGLU, `4 * d_model` for GELU. Don't recompute here.
+
+```python
+def forward(self, x, mask=None):
+    h = x + self.attn(self.norm1(x), mask=mask)
+    h = h + self.ffn(self.norm2(h))
+    return h
+```
+
+Pre-norm residual pattern. Two lines, the whole architecture in two
+expressions. Read literally:
+
+1. Normalize x, run attention on the normalized version, add to original x.
+   Norm sits *inside* the sublayer branch; residual stream stays clean.
+2. Same pattern for FFN: normalize, transform, add.
+
+Mask passed through to attention; FFN doesn't need it (FFNs operate
+per-position).
+
+### Interview Qs
+
+- **Why pre-norm beats post-norm at depth.**
+  Post-norm sits *on the residual stream itself*: `y = LayerNorm(x +
+  sublayer(x))`. Gradients flowing back have to pass through every norm,
+  which controls the magnitude of the backward signal. At depth this
+  requires careful warmup (Vaswani used 4000 steps for a 6-layer model).
+  Pre-norm: `y = x + sublayer(LayerNorm(x))`. The residual stream is a
+  pure identity path; norms only affect the sublayer branch. Gradient
+  flow is exponentially better. Training is stable at 100+ layers without
+  warmup gymnastics. See Xiong et al. 2020 for the spectral analysis.
+
+- **Why two norms per block, not one or three?**
+  One norm per sublayer. Two sublayers (attention, FFN) ⇒ two norms.
+  Each sublayer's input distribution needs stabilization independently
+  — attention output has different scale and skew than FFN input. NormFormer
+  proposes a third norm post-FFN with marginal gains; not standard.
+
+- **Why is the norm picker a closure, not a class-level method?**
+  Used twice, only inside `__init__`. Closure keeps it local — no
+  pollution of the class API, no need to remember to pass `self.config`
+  to it. Same code without the closure would be a repeated `if` block
+  for norm1 and norm2. (Pythonically equivalent; this is style.)
+
+- **Why does the block construct RoPE itself instead of receiving it from
+  the LM?**
+  Each block needs its own RoPE module so the buffer lives on the same
+  device as the rest of the block's parameters (moved via
+  `model.to(device)`). Could share one RoPE across blocks at the LM
+  level — same cache values — but the bookkeeping cost is higher than
+  the duplication cost: cache is only `O(context_len * head_dim / 2 *
+  4 bytes)` per block ≈ a few KB.
+
+- **Why does the FFN dropout default to `config.dropout` here but the
+  attention also gets `config.dropout`?**
+  In this project, one dropout knob controls all. nanoGPT uses the same
+  convention. Some impls (e.g., HF's GPT-2) separate `attn_pdrop` and
+  `resid_pdrop`; that's overfitting the API for marginal ablation value.
+
+- **Why doesn't `forward` do anything with the mask in the FFN step?**
+  FFN is per-position — each token's FFN output depends only on its own
+  input. No cross-position interaction, so no mask needed. Only the
+  attention sublayer mixes information across positions, and that's where
+  the mask is applied.
+
+### Test coverage
+
+`tests/test_layers.py` (10 cases):
+- `test_block_forward_shape_preserved` — `(B, T, C)` in/out.
+- `test_block_norm_switch_layernorm` / `..._rmsnorm` — config drives norm
+  type; both norm1 and norm2 are the same type.
+- `test_block_activation_switch_gelu` / `..._swiglu` — config drives FFN
+  type.
+- `test_block_rope_switch_on` — `pos_encoding="rope"` puts a
+  `RotaryEmbedding` on the MHA's `rotary` slot.
+- `test_block_rope_switch_off` — `pos_encoding="learned"` keeps `rotary=None`.
+- `test_block_modern_variant_all_switches` — the most-complex ablation
+  variant ("modern": rmsnorm + swiglu + rope) constructs and forwards
+  end-to-end.
+- `test_block_gradient_flows_to_input_and_all_params` — gradient flow,
+  finite gradients on every named param.
+- `test_block_residual_pattern_attn_then_ffn` — parameter accounting:
+  all of the block's params are in `{norm1, norm2, attn, ffn}`. Regression
+  if someone accidentally adds a stray learnable parameter to the block.
+
+### Indirect coverage via `tests/test_model.py`, `test_train.py`, etc.
+
+Removing the `DummyBlock` patch from `conftest.py` means the existing 28
+infrastructure tests now exercise *real* layers:
+- `test_forward_with_targets_returns_loss` — real model output now goes
+  through real attention + real FFN; CE loss is real, ~ln(vocab_size) at
+  init as the test expected.
+- `test_grad_flows_to_all_params` — gradient flows through real attention,
+  real norms, real FFN.
+- `test_train_runs_end_to_end` — 3 real training steps with real layers.
+- `test_run_ablation_smoke` — 2 variants × 1 seed × 3 steps with real
+  layers, including real RMSNorm in the rmsnorm variant.
+
+All pass on first attempt — the layers' shapes, gradients, init, and
+config-switching are correct as observed by the model/train/eval/ablation
+stack.
+
+### What's next (out of layers.py scope)
+
+- `python data.py prepare` to download TinyStories (~2 GB).
+- `python ablation.py --max-steps 500 --variants baseline rmsnorm rope swiglu modern --seeds 0`
+  for a short smoke run that produces a real `summary.csv`.
+- Plotting / analysis script over `summary.csv` once seeds finish.
+- README with honest authorship attribution (separately tracked).
