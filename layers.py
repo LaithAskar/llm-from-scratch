@@ -318,6 +318,102 @@ class SwiGLUFFN(nn.Module):
         return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
+class MoEFFN(nn.Module):
+    """
+    Mixture-of-Experts feed-forward (Shazeer et al. 2017 / Switch Transformer
+    style). Each token is routed to top-k of N experts; the output is a
+    convex combination of the chosen experts' outputs (weights = renormalized
+    router probabilities).
+
+    Param budget: with N experts each at inner dim d_ffn_per_expert, total
+    expert params are N * 2 * d_model * d_ffn_per_expert (two linears per
+    expert, bias=False). To match a baseline GeluFFN with d_ffn = 4*d_model,
+    set d_ffn_per_expert = 4*d_model / N (rounded). For N=4, d_model=128:
+    d_ffn_per_expert = 128 — matches the GELU baseline's 131K FFN params
+    within a few hundred (router adds N*d_model).
+
+    Load-balancing aux loss (Switch Transformer eq. 4):
+        aux = N * sum_i (f_i * P_i)
+    where f_i is the fraction of tokens routed to expert i (any of top-k),
+    and P_i is the mean router probability for expert i. Perfectly balanced
+    -> aux = 1. Collapsed (one expert) -> aux = N. Multiply by a small
+    coefficient (default 0.01) and add to the main CE loss.
+
+    Stored as self.last_aux_loss for the model to pick up after forward.
+    Set to None until first forward.
+
+    For inference, aux loss is still computed but the caller can ignore it.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ffn_per_expert: int,
+        num_experts: int,
+        top_k: int = 2,
+        bias: bool = False,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if top_k > num_experts:
+            raise ValueError(f"top_k ({top_k}) > num_experts ({num_experts})")
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = nn.Linear(d_model, num_experts, bias=False)
+        # Each expert is a small GELU FFN. SwiGLU would also work; using
+        # GELU here so the MoE variant is clearly "baseline + MoE" rather
+        # than confounded with the activation switch.
+        self.experts = nn.ModuleList([
+            GeluFFN(d_model=d_model, d_ffn=d_ffn_per_expert, bias=bias, dropout=dropout)
+            for _ in range(num_experts)
+        ])
+        self.last_aux_loss: torch.Tensor | None = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, C = x.shape
+        x_flat = x.reshape(B * T, C)
+
+        # Router. Computed in fp32 to keep softmax + load-balancing math stable.
+        router_logits = self.router(x_flat.float())               # (B*T, N)
+        router_probs = F.softmax(router_logits, dim=-1)           # (B*T, N)
+
+        # Top-k selection. Renormalize so each token's top-k weights sum to 1.
+        top_probs, top_idx = router_probs.topk(self.top_k, dim=-1)   # both (B*T, k)
+        top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+
+        # Aux loss (computed before any reduction by expert routing).
+        # f_i: fraction of tokens with expert i in their top-k.
+        N = self.num_experts
+        token_count = float(B * T)
+        # one-hot over top-k selections: (B*T, k, N)
+        one_hot = F.one_hot(top_idx, num_classes=N).float()
+        # Any-of-top-k assignment per (token, expert): (B*T, N)
+        assigned = one_hot.sum(dim=1).clamp(max=1.0)
+        f_i = assigned.sum(dim=0) / token_count                   # (N,)
+        P_i = router_probs.mean(dim=0)                            # (N,)
+        self.last_aux_loss = N * (f_i * P_i).sum()
+
+        # Combine expert outputs. Loop over experts (small N), gather
+        # assigned tokens, compute, scatter back with the routing weight.
+        out_flat = torch.zeros_like(x_flat)
+        for e in range(N):
+            # Mask of tokens routed to this expert (in any top-k slot).
+            slot_mask = (top_idx == e)                            # (B*T, k) bool
+            token_mask = slot_mask.any(dim=-1)                    # (B*T,) bool
+            if not token_mask.any():
+                continue
+            # Per-token weight for this expert = sum over its top-k slots
+            # of the renormalized probability mass on this expert.
+            weight = (top_probs * slot_mask.to(top_probs.dtype)).sum(dim=-1)  # (B*T,)
+            # Compute the expert's output only on its assigned tokens.
+            expert_in = x_flat[token_mask]
+            expert_out = self.experts[e](expert_in)
+            # Add the weighted contribution back into the output buffer.
+            out_flat[token_mask] = out_flat[token_mask] + weight[token_mask].unsqueeze(-1) * expert_out
+
+        return out_flat.reshape(B, T, C)
+
+
 class TransformerBlock(nn.Module):
     """
     One transformer decoder block.
@@ -378,8 +474,22 @@ class TransformerBlock(nn.Module):
             rotary=rotary,
         )
 
-        # FFN picker.
-        if config.activation == "swiglu":
+        # FFN picker — MoE takes precedence if enabled, else the activation switch.
+        if getattr(config, "num_experts", 0) >= 2:
+            # d_ffn_per_expert: param-matched to baseline (4*d_model)/N.
+            # config.d_ffn was resolved at config-construction time to 4*d_model
+            # (GELU default) or (8/3)*d_model (SwiGLU). We use the GELU figure
+            # divided by N so MoE matches the GELU-FFN baseline at the same N.
+            d_ffn_per_expert = max(1, (4 * config.d_model) // config.num_experts)
+            self.ffn = MoEFFN(
+                d_model=config.d_model,
+                d_ffn_per_expert=d_ffn_per_expert,
+                num_experts=config.num_experts,
+                top_k=config.top_k_experts,
+                bias=config.bias,
+                dropout=config.dropout,
+            )
+        elif config.activation == "swiglu":
             self.ffn = SwiGLUFFN(
                 d_model=config.d_model,
                 d_ffn=config.d_ffn,

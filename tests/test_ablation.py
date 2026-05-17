@@ -19,7 +19,7 @@ def test_variants_dict_contents():
     from ablation import variants
 
     v = variants()
-    assert set(v.keys()) == {"baseline", "rmsnorm", "rope", "swiglu", "modern"}
+    assert set(v.keys()) == {"baseline", "rmsnorm", "rope", "swiglu", "modern", "moe"}
     assert v["baseline"].norm_type == "layernorm"
     assert v["rmsnorm"].norm_type == "rmsnorm"
     assert v["rope"].pos_encoding == "rope"
@@ -27,11 +27,17 @@ def test_variants_dict_contents():
     assert v["modern"].norm_type == "rmsnorm"
     assert v["modern"].activation == "swiglu"
     assert v["modern"].pos_encoding == "rope"
+    assert v["moe"].num_experts == 4
+    assert v["moe"].top_k_experts == 2
 
     # d_ffn should auto-resolve to (8/3)*d_model rounded for swiglu variants
     base = v["baseline"]
     assert v["swiglu"].d_ffn != 4 * base.d_model  # different from gelu default
     assert v["modern"].d_ffn == v["swiglu"].d_ffn
+
+    # moe variant keeps baseline's GELU activation field (unused) — MoEFFN
+    # gets selected by num_experts>=2.
+    assert v["moe"].activation == "gelu"
 
 
 def test_run_ablation_smoke(tmp_path: Path):

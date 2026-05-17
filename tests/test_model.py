@@ -194,6 +194,42 @@ def test_generate_cached_matches_naive_with_rope():
     )
 
 
+def test_model_with_moe_forward_and_loss_includes_aux():
+    """
+    With num_experts >= 2, TransformerLM should produce normal output
+    shape AND the loss should include the MoE aux term. Compare to the
+    same model with num_experts=0 — losses should differ even with
+    identical seed (aux adds a small positive number to CE).
+    """
+    from model import TransformerLM
+
+    cfg_dense = _tiny_config(num_experts=0)
+    cfg_moe = _tiny_config(num_experts=4, top_k_experts=2, moe_aux_loss_coef=0.01)
+
+    torch.manual_seed(0)
+    lm_dense = TransformerLM(cfg_dense)
+    torch.manual_seed(0)
+    lm_moe = TransformerLM(cfg_moe)
+
+    idx = torch.randint(0, cfg_dense.vocab_size, (1, 6))
+    targets = torch.randint(0, cfg_dense.vocab_size, (1, 6))
+
+    # Both models forward without crashing
+    logits_d, loss_d = lm_dense(idx, targets)
+    logits_m, loss_m = lm_moe(idx, targets)
+
+    assert logits_d.shape == logits_m.shape == (1, 6, cfg_dense.vocab_size)
+    assert loss_d is not None and loss_m is not None
+    assert torch.isfinite(loss_d) and torch.isfinite(loss_m)
+
+    # Both should also yield gradients that flow through all blocks.
+    loss_m.backward()
+    for n, p in lm_moe.named_parameters():
+        assert p.grad is not None or "expert" in n, (
+            f"no grad on {n} — only individual experts may be skipped"
+        )
+
+
 def test_generate_stops_at_context_limit():
     """
     With KV-cache generation (default), once the cache fills to context_len

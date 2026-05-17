@@ -1434,3 +1434,204 @@ python bpe.py decode --tokenizer tiny_bpe.json --ids 264,1234,99
 Training on TinyStories train set (~2 GB) at vocab_size=4096 takes ~10-30
 minutes with the naive implementation. With `--max-chars 1_000_000` it's
 under a minute and produces a usable demonstration tokenizer.
+
+---
+
+## 10. Mixture of Experts (Part 5 — as ablation variant)
+
+**Files modified:**
+- `layers.py:MoEFFN` — new class (router + N experts + load-balancing aux loss).
+- `layers.py:TransformerBlock.__init__` — FFN picker now checks
+  `config.num_experts >= 2` first.
+- `config.py:ModelConfig` — new fields: `num_experts`, `top_k_experts`,
+  `moe_aux_loss_coef`.
+- `model.py:TransformerLM.forward` — accumulate per-block MoE aux loss
+  and add `coef * total_aux` to the CE loss when training.
+- `ablation.py:variants()` — new `"moe"` variant (num_experts=4, top_k=2).
+
+**Tests:** `tests/test_layers.py` (+8 cases), `tests/test_model.py`
+(+1 case), `tests/test_ablation.py` updated. Total 109 passing.
+
+### Design
+
+Switch Transformer-style MoE (Fedus et al. 2022). Each token is routed to
+top-k of N expert FFNs; output is a weighted combination using router
+probabilities. A load-balancing auxiliary loss prevents the common
+failure mode where the router collapses to always picking the same
+expert.
+
+**Why MoE in this ablation matrix?** The "Parts 4-9" scoping question
+naturally raised: can MoE be done at this scale? Answer: yes as an
+ablation variant. At 10M-class scale the *finding* is interesting on its
+own: MoE probably doesn't pay versus a matched-param dense baseline,
+because the design point that justifies MoE (skip experts to save
+compute on huge dense models) doesn't apply here. A clean negative
+result is itself the contribution.
+
+**Param matching.** Baseline GELU FFN at d_ffn=4·d_model has 8·d_model²
+FFN params. N-expert MoE at d_ffn_per_expert = 4·d_model/N also has
+8·d_model² (plus a tiny d_model·N router head). For d_model=128, N=4:
+both at 131K, matched within ~0.5% (verified by
+`test_moe_ffn_param_count_matches_gelu_baseline`).
+
+### Walkthrough — `MoEFFN.forward`
+
+```python
+B, T, C = x.shape
+x_flat = x.reshape(B * T, C)
+router_logits = self.router(x_flat.float())
+router_probs = F.softmax(router_logits, dim=-1)
+top_probs, top_idx = router_probs.topk(self.top_k, dim=-1)
+top_probs = top_probs / top_probs.sum(dim=-1, keepdim=True)
+```
+
+Flatten batch + time into one token axis (so we can do per-token routing
+without tedious per-position bookkeeping). Compute router logits in fp32
+(softmax stability + the load-balancing math being small-number-sensitive).
+Pick top-k experts per token; renormalize so the top-k weights sum to 1
+(otherwise the per-expert weighted sum would have norm < 1 in expectation,
+biasing the output).
+
+```python
+N = self.num_experts
+token_count = float(B * T)
+one_hot = F.one_hot(top_idx, num_classes=N).float()
+assigned = one_hot.sum(dim=1).clamp(max=1.0)
+f_i = assigned.sum(dim=0) / token_count
+P_i = router_probs.mean(dim=0)
+self.last_aux_loss = N * (f_i * P_i).sum()
+```
+
+Compute aux loss. `assigned[t, e] = 1` if expert e is in token t's top-k,
+else 0. `f_i` is the fraction of tokens routed to expert i.
+`P_i` is the average router probability for expert i. At perfect balance:
+`f_i = top_k / N`, `P_i = 1/N`, so `aux = N · N · (top_k/N · 1/N) = top_k`.
+At collapse (one expert always picked): `f_0 = 1, P_0 ≈ 1`, so `aux ≈ N`.
+
+```python
+out_flat = torch.zeros_like(x_flat)
+for e in range(N):
+    slot_mask = (top_idx == e)
+    token_mask = slot_mask.any(dim=-1)
+    if not token_mask.any(): continue
+    weight = (top_probs * slot_mask.to(top_probs.dtype)).sum(dim=-1)
+    expert_in = x_flat[token_mask]
+    expert_out = self.experts[e](expert_in)
+    out_flat[token_mask] = out_flat[token_mask] + weight[token_mask].unsqueeze(-1) * expert_out
+return out_flat.reshape(B, T, C)
+```
+
+Loop over experts (small N: 4). For each, gather the tokens routed to
+it, compute the FFN forward on just those tokens, scatter the
+weighted output back. This is the "dispatch + combine" pattern. For
+large-N production MoE (e.g., 64+ experts) this is replaced by tensor
+ops or specialized libraries (Megatron, DeepSpeed-MoE); for N=4 a
+Python loop is fine.
+
+### Why the aux loss is added in `model.forward` and not in MoEFFN
+
+MoEFFN stores `self.last_aux_loss` after each forward. The model is the
+right place to *use* it because:
+- The aux loss is per-block, but the regularization is on the model as
+  a whole — sum across blocks then multiply by one coefficient.
+- The aux loss only matters when computing training loss (targets provided);
+  during pure inference (`targets is None`), the aux can be ignored.
+- The coefficient is a model-level hyperparameter, not a per-layer one.
+
+Implementation in `model.forward`:
+```python
+aux_total = 0.0
+for block in self.blocks:
+    aux = getattr(block.ffn, "last_aux_loss", None)
+    if aux is not None:
+        aux_total = aux_total + aux
+if isinstance(aux_total, torch.Tensor):
+    coef = getattr(self.config, "moe_aux_loss_coef", 0.01)
+    loss = loss + coef * aux_total
+```
+
+`getattr` with default returns None for non-MoE FFNs, so dense models
+incur no cost. The `isinstance(aux_total, torch.Tensor)` guard means the
+add only happens when at least one block contributed — otherwise
+`aux_total` stays a Python float 0.0 and is skipped.
+
+### Interview Qs you should be able to answer
+
+- **Why MoE? What's the win?**
+  Conditional computation: at training time, total params can be much
+  larger than dense (because each token only activates a fraction). At
+  inference, only top-k experts compute per token. Lets you scale model
+  capacity without scaling per-token compute. Used in GPT-4, Mixtral 8x7B,
+  Grok, DeepSeek V3.
+
+- **Why doesn't it pay at 10M scale?**
+  Two reasons. First, the FLOP savings only matter once the dense
+  baseline is too expensive to train — at 10M, dense is trivially
+  cheap, so MoE's "save compute" pitch is moot. Second, expert
+  differentiation requires that each expert gets enough tokens to
+  learn distinct functions; at small batch × small expert count, the
+  router doesn't get the signal to differentiate.
+
+- **What's the load-balancing loss for?**
+  Without it, the router learns the easiest gradient path: route
+  everything to one expert. That collapses MoE into "one expert + N-1
+  dead experts." The aux loss penalizes imbalance: at perfect balance
+  aux = top_k; at collapse aux = N. With coefficient 0.01, even a
+  small imbalance creates a counter-gradient that nudges the router
+  back toward uniform.
+
+- **Why use the renormalized top-k probabilities for combining?**
+  Top-k slicing throws away the bottom-(N-k) probabilities. If we used
+  the raw top-k probs to weight expert outputs, the result would have
+  norm proportional to `sum(top_probs)` which is generally < 1, biasing
+  the model toward smaller activations. Renormalizing the top-k probs
+  to sum to 1 keeps the activation magnitude consistent across tokens
+  regardless of how peaked vs flat the router was.
+
+- **Why top-k=2 (not 1)?**
+  Top-1 (Switch Transformer) has the smallest compute but the largest
+  gradient variance — only one expert gets a gradient signal per token.
+  Top-2 doubles the compute but stabilizes training: gradients flow
+  through both selected experts. Mixtral uses top-2; DeepSeek V3 uses
+  top-8. There's no single right answer; it's a compute-vs-stability
+  knob.
+
+- **What does the router actually compute, geometrically?**
+  A linear projection from `d_model` to `num_experts`, then softmax.
+  Each expert's column in the router weight is essentially a "preferred
+  direction" in embedding space — tokens whose embedding aligns with
+  that direction get routed to that expert. Over training, experts
+  specialize on different input distributions; the router learns to
+  send each token to the experts that handle its kind of input best.
+  At 10M scale this specialization is weak; at 100M+ it becomes
+  measurable (e.g., one expert handles math, another handles code).
+
+### Test coverage
+
+`tests/test_layers.py` (+8):
+- `test_block_moe_picker` — `num_experts>=2` -> MoEFFN; else GELU/SwiGLU.
+- `test_moe_ffn_output_shape`
+- `test_moe_ffn_rejects_top_k_above_num_experts`
+- `test_moe_ffn_aux_loss_is_set_after_forward` — None before, tensor after.
+- `test_moe_ffn_aux_loss_at_perfect_balance` — uniform router, aux ≈ top_k.
+- `test_moe_ffn_aux_loss_at_collapse` — collapsed router, aux > balanced.
+- `test_moe_ffn_gradient_flows` — router gradient required; individual
+  experts may not get grad if no tokens routed to them in this batch.
+- `test_moe_ffn_param_count_matches_gelu_baseline` — within 1% of
+  baseline at d_model=128, N=4.
+
+`tests/test_model.py` (+1):
+- `test_model_with_moe_forward_and_loss_includes_aux` — end-to-end
+  through TransformerLM. Both dense and MoE models forward + backward
+  successfully; MoE loss includes the aux term.
+
+`tests/test_ablation.py`:
+- `test_variants_dict_contents` updated to expect 6 variants including
+  `moe`, with `num_experts=4, top_k_experts=2`.
+
+### Open question for the ablation run
+
+The hypothesis is that at toy scale, `moe` will roughly match `baseline`
+on val loss but cost slightly more wall-clock (router overhead). The
+real signal would come at 100M+ dense baseline, which is out of scope.
+The `summary.csv` should show whether this hypothesis holds.

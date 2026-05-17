@@ -62,12 +62,17 @@ def base_train_config() -> TrainConfig:
 
 def variants(base: ModelConfig | None = None) -> dict[str, ModelConfig]:
     """
-    Returns the five ablation variants.
+    Returns the ablation variants.
 
     Each variant uses `replace` so the base model size, vocab, context, etc.
-    are identical — only the three switches differ. d_ffn is re-resolved to
-    None for swiglu variants so __post_init__ applies the PaLM (8/3)*d_model
-    matched-FFN sizing.
+    are identical — only the architecture switches differ.
+      - swiglu variants set d_ffn=None so __post_init__ applies PaLM's
+        (8/3)*d_model matched-FFN sizing.
+      - moe variant sets num_experts=4, top_k=2; per-expert d_ffn is
+        auto-sized in TransformerBlock to match the baseline's GELU
+        d_ffn=4*d_model at 4 experts (so each expert has d_ffn=d_model).
+        d_ffn left at the GELU baseline (4*d_model) because MoE doesn't use
+        the d_ffn field directly — it computes per-expert size.
     """
     b = base or base_model_config()
     return {
@@ -76,6 +81,7 @@ def variants(base: ModelConfig | None = None) -> dict[str, ModelConfig]:
         "rope":     replace(b, pos_encoding="rope"),
         "swiglu":   replace(b, activation="swiglu", d_ffn=None),
         "modern":   replace(b, norm_type="rmsnorm", activation="swiglu", pos_encoding="rope", d_ffn=None),
+        "moe":      replace(b, num_experts=4, top_k_experts=2),
     }
 
 

@@ -13,6 +13,7 @@ import torch
 
 from layers import (
     GeluFFN,
+    MoEFFN,
     MultiHeadAttention,
     RMSNorm,
     RotaryEmbedding,
@@ -723,6 +724,117 @@ def test_block_gradient_flows_to_input_and_all_params():
     for n, p in block.named_parameters():
         assert p.grad is not None, f"no grad on {n}"
         assert torch.isfinite(p.grad).all(), f"non-finite grad on {n}"
+
+
+def test_block_moe_picker():
+    """If config.num_experts >= 2, block.ffn is a MoEFFN; otherwise GELU/SwiGLU."""
+    block_moe = TransformerBlock(_tiny_block_config(num_experts=4, top_k_experts=2))
+    assert isinstance(block_moe.ffn, MoEFFN)
+    block_dense = TransformerBlock(_tiny_block_config(num_experts=0))
+    assert isinstance(block_dense.ffn, GeluFFN)
+
+
+# --- MoEFFN ----------------------------------------------------------------
+
+
+def test_moe_ffn_output_shape():
+    moe = MoEFFN(d_model=32, d_ffn_per_expert=16, num_experts=4, top_k=2)
+    x = torch.randn(2, 5, 32)
+    y = moe(x)
+    assert y.shape == x.shape
+
+
+def test_moe_ffn_rejects_top_k_above_num_experts():
+    with pytest.raises(ValueError, match="top_k"):
+        MoEFFN(d_model=8, d_ffn_per_expert=8, num_experts=2, top_k=4)
+
+
+def test_moe_ffn_aux_loss_is_set_after_forward():
+    """last_aux_loss starts None, gets a tensor after the first forward."""
+    moe = MoEFFN(d_model=16, d_ffn_per_expert=16, num_experts=4, top_k=2)
+    assert moe.last_aux_loss is None
+    _ = moe(torch.randn(1, 4, 16))
+    assert isinstance(moe.last_aux_loss, torch.Tensor)
+    assert torch.isfinite(moe.last_aux_loss)
+
+
+def test_moe_ffn_aux_loss_at_perfect_balance():
+    """
+    Switch Transformer aux = N * sum(f_i * P_i).
+      - f_i: fraction of tokens with expert i in top-k. At perfect balance:
+        each token contributes to k experts (its top-k), so total
+        contributions = batch * k, spread evenly across N experts:
+        f_i = k/N.
+      - P_i: mean router prob for expert i. Uniform router -> P_i = 1/N.
+      - aux = N * N * (k/N * 1/N) = k.
+
+    So with top_k=2, balanced aux ~= 2.0 (not 1.0 — that's the top_k=1 case
+    in the original Switch Transformer paper).
+    """
+    N = 4
+    top_k = 2
+    moe = MoEFFN(d_model=16, d_ffn_per_expert=16, num_experts=N, top_k=top_k)
+    moe.eval()
+    with torch.no_grad():
+        moe.router.weight.zero_()  # uniform router logits -> uniform probs
+    x = torch.randn(1, 200, 16)
+    _ = moe(x)
+    assert abs(moe.last_aux_loss.item() - float(top_k)) < 0.2, (
+        f"perfectly-balanced aux at top_k={top_k} should be ~{top_k}, "
+        f"got {moe.last_aux_loss.item():.3f}"
+    )
+
+
+def test_moe_ffn_aux_loss_at_collapse():
+    """
+    If the router collapses (all probability on expert 0), then P_0 ~= 1,
+    f_0 ~= 1 (every token's top-k contains expert 0), other f_i, P_i ~= 0.
+    aux ~= N * f_0 * P_0 = N.
+
+    For top_k=2 the second-place expert still has some weight, but the
+    collapsed equilibrium is well above the balanced one. Balanced (top_k=2)
+    is ~2; collapsed should be > 2.5.
+    """
+    N = 4
+    moe = MoEFFN(d_model=16, d_ffn_per_expert=16, num_experts=N, top_k=2)
+    moe.eval()
+    with torch.no_grad():
+        moe.router.weight.zero_()
+        moe.router.weight[0].fill_(50.0)
+    # Use constant positive input so weight[0] @ x is reliably positive
+    # for every token. (randn input has half negative, which would flip
+    # the dominant logit per-token and prevent collapse.)
+    x = torch.ones(1, 100, 16)
+    _ = moe(x)
+    assert moe.last_aux_loss.item() > 3.0, (
+        f"collapsed aux should be > balanced ~2.0, got {moe.last_aux_loss.item():.3f}"
+    )
+
+
+def test_moe_ffn_gradient_flows():
+    moe = MoEFFN(d_model=16, d_ffn_per_expert=16, num_experts=4, top_k=2)
+    x = torch.randn(2, 4, 16, requires_grad=True)
+    moe(x).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    # At least the router parameters should always get gradients (router
+    # probs feed into every output). Individual experts may not get grads
+    # in a single batch if no tokens were routed to them — that's allowed.
+    assert moe.router.weight.grad is not None
+    assert torch.isfinite(moe.router.weight.grad).all()
+
+
+def test_moe_ffn_param_count_matches_gelu_baseline():
+    """
+    With d_model=128, baseline GELU FFN has d_ffn=4*d_model=512 -> 131K params
+    (2*128*512). N=4 MoE with d_ffn_per_expert=4*d_model/N=128 -> 131K expert
+    params (4 * 2 * 128 * 128) + 512 router weights. Match within ~0.5%.
+    """
+    d_model = 128
+    gelu = GeluFFN(d_model=d_model, d_ffn=4 * d_model, bias=False)
+    moe = MoEFFN(d_model=d_model, d_ffn_per_expert=d_model, num_experts=4, top_k=2, bias=False)
+    n_gelu = sum(p.numel() for p in gelu.parameters())
+    n_moe = sum(p.numel() for p in moe.parameters())
+    assert abs(n_gelu - n_moe) / n_gelu < 0.01, f"GELU={n_gelu}, MoE={n_moe}"
 
 
 def test_block_residual_pattern_attn_then_ffn():

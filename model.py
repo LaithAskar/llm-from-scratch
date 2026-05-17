@@ -133,6 +133,18 @@ class TransformerLM(nn.Module):
                 targets.view(-1),
                 ignore_index=-100,
             )
+            # If any block's FFN is a MoE, accumulate its load-balancing aux
+            # loss (Switch Transformer eq. 4) and add to CE loss. Non-MoE
+            # FFNs don't have last_aux_loss; getattr returns None and is
+            # skipped. Coefficient lives on the model config.
+            aux_total = 0.0
+            for block in self.blocks:
+                aux = getattr(block.ffn, "last_aux_loss", None)
+                if aux is not None:
+                    aux_total = aux_total + aux
+            if isinstance(aux_total, torch.Tensor):
+                coef = getattr(self.config, "moe_aux_loss_coef", 0.01)
+                loss = loss + coef * aux_total
         return logits, loss
 
     @torch.no_grad()

@@ -43,6 +43,13 @@ class ModelConfig:
     # norm-specific
     norm_eps: float = 1e-5
 
+    # MoE (Switch Transformer-style). num_experts=0 disables MoE entirely
+    # (the activation switch picks GELU or SwiGLU). num_experts>=2 enables MoE;
+    # the activation field is then unused (each expert is its own GELU FFN).
+    num_experts: int = 0
+    top_k_experts: int = 2
+    moe_aux_loss_coef: float = 0.01
+
     def __post_init__(self):
         if self.d_model % self.n_head != 0:
             raise ValueError(
