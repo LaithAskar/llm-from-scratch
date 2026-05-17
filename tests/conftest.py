@@ -13,19 +13,26 @@ from __future__ import annotations
 
 import pytest
 
-from _dummies import DummyBlock, DummyRMSNorm, dummy_causal_mask
+from _dummies import DummyBlock, DummyRMSNorm  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def patch_layers(monkeypatch):
+    """
+    Replace still-stubbed layers with working dummies so the rest of the
+    infrastructure (model.py / train.py / eval.py / ablation.py) can be
+    exercised end-to-end. As real implementations land in layers.py, the
+    corresponding patch lines come out of this fixture.
+
+    Currently real (not patched): causal_mask.
+    Still stubs (patched here):   RMSNorm, TransformerBlock.
+    """
     import layers
     import model as model_mod
 
     monkeypatch.setattr(layers, "TransformerBlock", DummyBlock)
     monkeypatch.setattr(layers, "RMSNorm", DummyRMSNorm)
-    monkeypatch.setattr(layers, "causal_mask", dummy_causal_mask)
     # model.py imported these symbols at module-load time; patch its namespace too.
     monkeypatch.setattr(model_mod, "TransformerBlock", DummyBlock)
     monkeypatch.setattr(model_mod, "RMSNorm", DummyRMSNorm)
-    monkeypatch.setattr(model_mod, "causal_mask", dummy_causal_mask)
     yield

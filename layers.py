@@ -111,10 +111,9 @@ def causal_mask(seq_len: int, device: Optional[torch.device] = None) -> torch.Te
     True == attend, False == mask out.
 
     For decoder-style autoregressive attention, this prevents position i from
-    looking at positions j > i. Useful smoke-test ingredient for forward().
+    looking at positions j > i.
     """
-    # TODO: return torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
-    raise NotImplementedError("Implement causal_mask.")
+    return torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
 
 
 class RMSNorm(nn.Module):
