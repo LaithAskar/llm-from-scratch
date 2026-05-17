@@ -15,6 +15,7 @@ dependencies = [
     "numpy>=1.26",
     "matplotlib>=3.8",
     "tqdm>=4.66",
+    "regex>=2024.0",  # for bpe.py's GPT-2 pre-tokenization regex (\p{L}, \p{N})
 ]
 
 [project.optional-dependencies]
@@ -23,7 +24,7 @@ dev = ["pytest>=8.0"]
 [tool.setuptools]
 # Single-module layout: each .py at repo root is its own importable module.
 # Don't try to autodetect packages — there's no src/ tree and tests/ is not a package.
-py-modules = ["config", "data", "layers", "model", "train", "eval", "ablation", "verify_setup"]
+py-modules = ["config", "data", "layers", "model", "train", "eval", "ablation", "bpe", "verify_setup"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

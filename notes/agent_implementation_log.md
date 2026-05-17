@@ -1218,3 +1218,219 @@ Two key tricks:
 `test_generate_truncates_long_context`) was updated. The old naive path
 silently slid a context window and kept appending; the new cached path
 hard-stops when the cache fills. Honest API > quietly-degrading API.
+
+---
+
+## 9. BPE training (Part 4)
+
+**File:** `bpe.py` (new module)
+**Tests:** `tests/test_bpe.py` (15 cases)
+
+### Design
+
+Standard byte-pair encoding (Sennrich et al. 2015). The algorithm:
+
+1. **Pre-tokenize** text into "words" using GPT-2's regex (which keeps
+   leading whitespace attached to the following word, separates punctuation
+   from letters, etc.). This prevents merges from crossing natural word
+   boundaries.
+2. **Initialize** vocab with all 256 single-byte tokens.
+3. **Repeat** until vocab_size is reached:
+   - Count adjacent token-pair frequencies across all words (weighted by
+     word frequency).
+   - Find the most frequent pair.
+   - Add the merged token to the vocab, record the merge in the merge list.
+   - Replace every occurrence in every word.
+
+The ablation matrix still uses tiktoken's GPT-2 BPE so vocab is held
+constant across variants. This module is a **standalone artifact**
+demonstrating the algorithm, not a drop-in replacement for tiktoken.
+
+### Pre-tokenization regex (GPT-2 convention)
+
+```
+'(?:[sdmt]|ll|ve|re) | ?\p{L}+ | ?\p{N}+ | ?[^\s\p{L}\p{N}]+ | \s+(?!\S) | \s+
+```
+
+What each branch matches:
+- `'(?:[sdmt]|ll|ve|re)` — English contractions ('s, 'd, 'm, 't, 'll, 've, 're)
+- ` ?\p{L}+` — letters with optional leading space (so " hello" is one token)
+- ` ?\p{N}+` — numbers with optional leading space (" 2026")
+- ` ?[^\s\p{L}\p{N}]+` — punctuation runs with optional leading space
+- `\s+(?!\S)` — trailing whitespace (used to keep final spaces from being orphaned)
+- `\s+` — interior whitespace runs
+
+Requires the `regex` package (stdlib `re` doesn't support `\p{L}` /
+`\p{N}` as of Python 3.13).
+
+### Encoding strategy
+
+Given a trained merge list, encoding "hello" works by:
+1. Pre-tokenize into pre-tokens (here: `b"hello"`).
+2. Split each pre-token into single bytes (`[b"h", b"e", b"l", b"l", b"o"]`).
+3. Repeatedly find the pair with the **lowest merge index** (= the
+   earliest-learned merge) and apply it. Repeat until no learned merges
+   remain.
+4. Look up each remaining token in the vocab to get its integer ID.
+
+The "lowest-merge-first" priority matches tiktoken and Hugging Face's
+GPT-2 BPE. Alternative strategies (highest-frequency-first, greedy-longest
+match) exist but produce different encodings — same vocab, different IDs
+for the same text. This implementation uses GPT-2's convention.
+
+### Walkthrough — `train_bpe`
+
+```python
+words = pretokenize(corpus)
+word_freqs = collections.Counter(words)
+word_freqs_split = {
+    tuple(bytes([b]) for b in word): freq
+    for word, freq in word_freqs.items()
+}
+vocab = {bytes([i]): i for i in range(256)}
+merges = []
+```
+
+Initialize: count word frequencies, split each word into byte-tokens, set
+up the initial 256-byte vocab.
+
+```python
+for step in range(vocab_size - 256):
+    pair_counts = _count_pairs(word_freqs_split)
+    if not pair_counts: break
+    best_pair, best_count = max(pair_counts.items(), key=lambda kv: kv[1])
+    merged = best_pair[0] + best_pair[1]
+    vocab[merged] = len(vocab)
+    merges.append(best_pair)
+    word_freqs_split = {
+        _apply_merge(word, best_pair): freq
+        for word, freq in word_freqs_split.items()
+    }
+```
+
+The merge loop. Each iteration: count pairs across all words, pick the
+most-frequent, add the merged token (with the next-available integer ID)
+to the vocab, record the merge, apply it to every word.
+
+**Efficiency note.** This implementation re-counts all pairs from scratch
+on every iteration — O(N * V) where N is total tokens and V is merges.
+A production impl maintains an incremental pair-count table and only
+updates around the affected positions — O(K) per merge where K is the
+number of occurrences of the merged pair. For toy-scale corpora (< 100 MB)
+the simple approach is fine and ~5x easier to verify by hand.
+
+### Walkthrough — `encode`
+
+```python
+merge_rank = {pair: i for i, pair in enumerate(merges)}
+for word in pretokenize(text):
+    tokens = [bytes([b]) for b in word]
+    while len(tokens) > 1:
+        best_rank = len(merges); best_pos = -1
+        for i in range(len(tokens) - 1):
+            rank = merge_rank.get((tokens[i], tokens[i + 1]), len(merges))
+            if rank < best_rank:
+                best_rank = rank
+                best_pos = i
+        if best_pos < 0: break
+        tokens = tokens[:best_pos] + [tokens[best_pos] + tokens[best_pos+1]] + tokens[best_pos+2:]
+    out.extend(vocab[t] for t in tokens)
+```
+
+Greedy lowest-merge-rank application. The inner loop scans all adjacent
+pairs and picks the one with the smallest merge index. Apply it; repeat
+until no pair is in `merge_rank`. Then look up each remaining token's ID.
+
+The `merge_rank.get(pair, len(merges))` trick treats unknown pairs as
+"infinity rank" — they're never picked because any known pair has rank
+< len(merges).
+
+### Interview Qs you should be able to answer
+
+- **Why pre-tokenize before BPE?**
+  Without pre-tokenization, BPE could merge across word boundaries —
+  things like "the dog" → "thedog" as a single token. Pre-tokenization
+  caps merges at the word level, which both (a) gives more interpretable
+  tokens and (b) prevents combinatorial explosion in the merge space.
+  GPT-2's regex is empirically tuned to give good English-language
+  coverage.
+
+- **Why bytes (256 base vocab) instead of unicode characters?**
+  Unicode-character base would mean ~1M code points → huge initial vocab.
+  Most LLMs never see most code points. Byte-level (256 fixed initial
+  vocab) is universal — every text is encodable, BPE figures out which
+  byte sequences are worth merging based on the actual training corpus.
+
+- **What's the difference between BPE and WordPiece (BERT) or Unigram (T5)?**
+  BPE: greedy merge of most-frequent pair. Deterministic given the
+  corpus.
+  WordPiece: BPE variant that picks the merge maximizing likelihood of
+  the corpus under the resulting tokenization (slightly different
+  objective; usually similar results).
+  Unigram (SentencePiece): start with a large vocab, prune least-useful
+  tokens iteratively until target size. Better at handling languages
+  without natural word boundaries.
+
+- **Why "lowest merge index" for encoding, not "highest frequency"?**
+  Because the merge order *records the algorithm's own training-time
+  decisions*. If at training step 3 the algorithm chose to merge ('e',
+  'd'), it did so because at that point in the iterative merging, 'ed'
+  was the right choice — even if later merges made other pairs more
+  frequent. Replaying the same priority order at encode time gives
+  consistent tokenization with what the algorithm would produce if you
+  re-trained on the same text.
+
+- **What's the compression ratio you'd expect on English?**
+  GPT-2 BPE (50K vocab) is ~4 bytes/token on English text. A 4K vocab
+  trained from scratch on TinyStories gets ~3-3.5 bytes/token (less
+  efficient because of the smaller vocab, more efficient on
+  TinyStories's narrow distribution than GPT-2 BPE is on it).
+  Single-byte (no merges, just bytes) is 1 byte/token by definition.
+
+- **Why isn't this BPE compatible with GPT-2's BPE?**
+  Different training corpus, different merge order, different final
+  vocab. Even with identical algorithms, different data produces
+  different tokenizers. To be GPT-2 BPE compatible, you'd need GPT-2's
+  exact training data — which is proprietary.
+
+### Test coverage
+
+`tests/test_bpe.py` (15 cases):
+
+Pretokenize:
+- `test_pretokenize_splits_words_and_keeps_spaces`
+- `test_pretokenize_separates_punctuation`
+- `test_pretokenize_handles_numbers`
+
+Train:
+- `test_train_bpe_initial_vocab_is_all_bytes` — vocab_size=256 → no merges.
+- `test_train_bpe_rejects_small_vocab` — ValueError on < 256.
+- `test_train_bpe_learns_repeated_pair` — `'ababab'` → merge ('a', 'b') first.
+- `test_train_bpe_learns_multiple_merges_in_order`
+- `test_train_bpe_stops_when_no_more_pairs`
+
+Encode/decode:
+- `test_encode_decode_round_trip_after_training`
+- `test_encode_decode_handles_unseen_text` — byte fallback for unseen chars.
+- `test_encode_reduces_token_count_vs_bytes` — actual compression check.
+- `test_encode_uses_lowest_merge_first` — priority order regression.
+
+Serialization:
+- `test_save_load_round_trip` — bytes ↔ hex JSON round-trip.
+- `test_save_load_then_encode_matches`.
+
+Non-ASCII:
+- `test_bpe_handles_non_ascii_via_utf8_bytes` — "café résumé naïve"
+  encodes and decodes correctly.
+
+### CLI
+
+```bash
+python bpe.py train --corpus data/tinystories/train.txt --vocab-size 4096 --out tiny_bpe.json
+python bpe.py encode --tokenizer tiny_bpe.json --text "hello world"
+python bpe.py decode --tokenizer tiny_bpe.json --ids 264,1234,99
+```
+
+Training on TinyStories train set (~2 GB) at vocab_size=4096 takes ~10-30
+minutes with the naive implementation. With `--max-chars 1_000_000` it's
+under a minute and produces a usable demonstration tokenizer.

@@ -7,4 +7,5 @@ tiktoken>=0.7.0
 numpy>=1.26
 matplotlib>=3.8
 tqdm>=4.66
+regex>=2024.0
 pytest>=8.0
