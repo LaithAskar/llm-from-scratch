@@ -5,7 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "llm-from-scratch-laith"
 version = "0.1.0"
-description = "Transformer LM built from scratch (Parts 1-3) + controlled architectural ablation."
+description = "Transformer LM built from scratch (Parts 1-3) + controlled architectural ablation. AI-implemented, human-supervised."
+readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Laith Askar" }]
