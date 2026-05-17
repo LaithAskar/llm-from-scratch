@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-from-scratch-laith"
+version = "0.1.0"
+description = "Transformer LM built from scratch (Parts 1-3) + controlled architectural ablation."
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "Laith Askar" }]
+dependencies = [
+    "tiktoken>=0.7.0",
+    "numpy>=1.26",
+    "matplotlib>=3.8",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools]
+# Single-module layout: each .py at repo root is its own importable module.
+# Don't try to autodetect packages — there's no src/ tree and tests/ is not a package.
+py-modules = ["config", "data", "layers", "model", "train", "eval", "ablation", "verify_setup"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Put project root AND tests/ on sys.path so tests can `import config`, `import layers`,
+# and conftest can `from _dummies import ...` without manual sys.path manipulation.
+pythonpath = [".", "tests"]
