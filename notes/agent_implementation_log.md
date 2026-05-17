@@ -515,5 +515,148 @@ yet. That happens in step 6 (TransformerBlock implementation).
 
 ---
 
-<!-- Next entries (GELU FFN, SwiGLU FFN, RoPE, TransformerBlock) appended
-     as components land. -->
+## 4. `GeluFFN(d_model, d_ffn, bias, dropout)`
+
+**File:** `layers.py:165-184`
+**Tests:** `tests/test_layers.py:294-320` (4 cases)
+**Patch status:** N/A — wasn't stubbed; new class added.
+
+### Design
+
+Classic two-matrix feed-forward: `y = down_proj(GELU(up_proj(x)))`. With
+`d_ffn = 4 * d_model` (Vaswani convention, set as the GELU default in
+`ModelConfig.__post_init__`), this layer carries 8 · d_model² params —
+roughly 2× the attention block's param count, and the dominant chunk of
+each transformer block's representational capacity.
+
+**Naming is load-bearing.** `model.py:_init_weights` applies GPT-2's
+residual init scaling (`std = 0.02 / sqrt(2*n_layer)`) to any parameter
+whose name ends in `out_proj.weight` or `down_proj.weight`. Calling the
+second linear `down_proj` is how GeluFFN opts in. Renaming it would
+silently disable the scaling, hurting training stability at depth.
+
+### Walkthrough
+
+```python
+def __init__(self, d_model, d_ffn, bias=False, dropout=0.0):
+    super().__init__()
+    self.up_proj = nn.Linear(d_model, d_ffn, bias=bias)
+    self.down_proj = nn.Linear(d_ffn, d_model, bias=bias)
+    self.dropout = nn.Dropout(dropout)
+
+def forward(self, x):
+    return self.dropout(self.down_proj(F.gelu(self.up_proj(x))))
+```
+
+Two linears with a GELU between. Dropout *after* the down-projection,
+before the residual add in TransformerBlock. Standard pattern.
+
+### Interview Qs
+
+- **Why is FFN dim 4×d_model?** Empirical from Vaswani 2017. Sweeps show a
+  broad optimum around 4×. Smaller hurts capacity; larger gives diminishing
+  returns and bloats VRAM. Modern frontier models use 4× (or its PaLM-style
+  equivalent `(8/3)×` for SwiGLU).
+- **Why GELU instead of ReLU?** Smoother around 0; small negative inputs
+  pass through with attenuation rather than being fully zeroed. Empirically
+  ~0.2-0.5 PPL improvement over ReLU on transformer LMs. GPT-2, BERT,
+  GPT-3 all use GELU.
+- **Why no normalization inside the FFN?** Pre-norm in TransformerBlock
+  normalizes the *input* to the FFN. A norm after the second linear
+  would double-normalize and tends to hurt — the residual stream wants to
+  be the only normalized object per sublayer.
+
+### Test coverage
+
+`tests/test_layers.py` (4 cases):
+- `test_gelu_ffn_preserves_outer_shape` — input/output shape match.
+- `test_gelu_ffn_param_count` — exactly `2 * d_model * d_ffn` params at bias=False.
+- `test_gelu_ffn_has_down_proj_name` — regression on the residual-init contract.
+- `test_gelu_ffn_gradient_flows` — grads to input + every param, finite.
+
+---
+
+## 5. `SwiGLUFFN(d_model, d_ffn, bias, dropout)`
+
+**File:** `layers.py:187-211`
+**Tests:** `tests/test_layers.py:325-371` (5 cases)
+**Patch status:** N/A — new class.
+
+### Design
+
+Gated linear unit with SiLU activation. Three matrices instead of two:
+
+```
+y = down_proj( silu(gate_proj(x)) * up_proj(x) )
+```
+
+The element-wise product `silu(gate_proj(x)) * up_proj(x)` is the gate.
+For each output channel, the gate (a learned function of x) decides how
+much of `up_proj(x)` to let through. Two-matrix FFNs can't represent this
+kind of multiplicative interaction.
+
+**Why three matrices but matched param count?** Two matrices of shape
+`C × 4C` = `8C²` params. Three matrices of shape `C × F` = `3CF`. Setting
+`3CF = 8C²` gives `F = (8/3) · C`. The project's `ModelConfig.__post_init__`
+does this calculation and rounds to a multiple of 64 (for GPU alignment).
+The point is the *controlled comparison* in the ablation: GELU vs SwiGLU
+at matched params — any quality difference is attributable to the
+architecture choice, not param count.
+
+**Naming:** `gate_proj`, `up_proj`, `down_proj` follow LLaMA convention.
+`down_proj.weight` triggers the residual scaling in model.py (same
+contract as GeluFFN).
+
+### Walkthrough
+
+```python
+def __init__(self, d_model, d_ffn, bias=False, dropout=0.0):
+    super().__init__()
+    self.gate_proj = nn.Linear(d_model, d_ffn, bias=bias)
+    self.up_proj = nn.Linear(d_model, d_ffn, bias=bias)
+    self.down_proj = nn.Linear(d_ffn, d_model, bias=bias)
+    self.dropout = nn.Dropout(dropout)
+
+def forward(self, x):
+    return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+```
+
+`F.silu(z) = z * sigmoid(z)`. Smooth, non-monotonic (slight bump in
+negative region), and gradient-friendly near zero. Has been called Swish-1
+elsewhere.
+
+### Interview Qs
+
+- **Why three matrices?** Multiplicative gating. The element-wise product
+  lets the model selectively pass or attenuate channels based on a learned
+  gate that's a function of the same input. Empirically (Shazeer 2020,
+  PaLM, LLaMA), this outperforms plain two-matrix FFNs at matched params.
+- **Why SiLU and not GELU inside the gate?** Empirical. Shazeer ablated
+  GLU variants (GeGLU, SwiGLU, ReGLU) and SwiGLU won at matched-params on
+  T5 perplexity. Practical reason: SiLU is cheaper than GELU (no `erf` or
+  tanh approximation needed).
+- **Why `(8/3) * d_model`?** Param-matching. Two matrices of C×4C =
+  8C² params. Three matrices of C×F = 3CF. Set equal → F = (8/3)C. The
+  rounding-to-64 is for tensor-core alignment, costs ~1% in param count.
+- **Where's the activation on `up_proj`?** There isn't one. `up_proj(x)`
+  passes through linearly; the only nonlinearity is `silu(gate_proj(x))`.
+  This is the GLU structure — one branch activated, one branch linear,
+  multiplied. (If both branches were activated you'd have a different
+  architecture, e.g., "double-SwiGLU.")
+
+### Test coverage
+
+`tests/test_layers.py` (5 cases):
+- `test_swiglu_ffn_preserves_outer_shape` — shape preserved.
+- `test_swiglu_ffn_param_count` — exactly `3 * d_model * d_ffn` params at bias=False.
+- `test_swiglu_param_match_to_gelu_via_palm_sizing` — at d_model=192,
+  PaLM-sized SwiGLU has within 5% of GELU(4*d_model)'s param count.
+  Regression on the matched-comparison invariant.
+- `test_swiglu_ffn_has_three_named_projections` — `gate_proj`, `up_proj`,
+  `down_proj` names present. Regression on the model.py init contract
+  and the LLaMA naming convention.
+- `test_swiglu_ffn_gradient_flows` — grads to input + every param, finite.
+
+---
+
+<!-- Next entries (RoPE, TransformerBlock) appended as components land. -->

@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from layers import MultiHeadAttention, RMSNorm, causal_mask
+from layers import GeluFFN, MultiHeadAttention, RMSNorm, SwiGLUFFN, causal_mask
 
 
 # --- causal_mask -----------------------------------------------------------
@@ -270,3 +270,87 @@ def test_mha_calls_rotary_hook_if_provided():
     mha_scaled.load_state_dict(mha_no_rope.state_dict())
     out3 = mha_scaled(x)
     assert out3.shape == x.shape
+
+
+# --- GeluFFN ---------------------------------------------------------------
+
+
+def test_gelu_ffn_preserves_outer_shape():
+    ffn = GeluFFN(d_model=32, d_ffn=128)
+    x = torch.randn(2, 5, 32)
+    y = ffn(x)
+    assert y.shape == (2, 5, 32)
+
+
+def test_gelu_ffn_param_count():
+    # 2 linears: (d_model -> d_ffn) and (d_ffn -> d_model). bias=False.
+    d_model, d_ffn = 32, 128
+    ffn = GeluFFN(d_model=d_model, d_ffn=d_ffn, bias=False)
+    expected = d_model * d_ffn + d_ffn * d_model
+    assert sum(p.numel() for p in ffn.parameters()) == expected
+
+
+def test_gelu_ffn_has_down_proj_name():
+    # model.py's _init_weights looks for `down_proj.weight` to apply the
+    # GPT-2 residual scaling. Regression: name must not drift.
+    ffn = GeluFFN(d_model=8, d_ffn=16)
+    names = {n for n, _ in ffn.named_parameters()}
+    assert "down_proj.weight" in names
+
+
+def test_gelu_ffn_gradient_flows():
+    ffn = GeluFFN(d_model=16, d_ffn=32)
+    x = torch.randn(2, 4, 16, requires_grad=True)
+    ffn(x).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for n, p in ffn.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), f"bad grad on {n}"
+
+
+# --- SwiGLUFFN -------------------------------------------------------------
+
+
+def test_swiglu_ffn_preserves_outer_shape():
+    ffn = SwiGLUFFN(d_model=32, d_ffn=64)
+    x = torch.randn(2, 5, 32)
+    y = ffn(x)
+    assert y.shape == (2, 5, 32)
+
+
+def test_swiglu_ffn_param_count():
+    # 3 linears: gate (C->F), up (C->F), down (F->C). bias=False.
+    d_model, d_ffn = 32, 64
+    ffn = SwiGLUFFN(d_model=d_model, d_ffn=d_ffn, bias=False)
+    expected = 3 * d_model * d_ffn
+    assert sum(p.numel() for p in ffn.parameters()) == expected
+
+
+def test_swiglu_param_match_to_gelu_via_palm_sizing():
+    # PaLM convention: for matched FFN params, set SwiGLU d_ffn = (8/3) * d_model.
+    # ModelConfig.__post_init__ rounds to multiple of 64. Verify that with the
+    # PaLM-sized d_ffn, the SwiGLU FFN has ~the same params as GELU at d_ffn=4*d_model.
+    d_model = 192
+    gelu = GeluFFN(d_model=d_model, d_ffn=4 * d_model)
+    palm_d_ffn = int(round(8 / 3 * d_model / 64)) * 64
+    swiglu = SwiGLUFFN(d_model=d_model, d_ffn=palm_d_ffn)
+    n_gelu = sum(p.numel() for p in gelu.parameters())
+    n_swiglu = sum(p.numel() for p in swiglu.parameters())
+    # Should match within rounding-to-64 slack (~5%).
+    assert abs(n_gelu - n_swiglu) / n_gelu < 0.05, f"GELU={n_gelu}, SwiGLU={n_swiglu}"
+
+
+def test_swiglu_ffn_has_three_named_projections():
+    ffn = SwiGLUFFN(d_model=8, d_ffn=16)
+    names = {n for n, _ in ffn.named_parameters()}
+    assert "gate_proj.weight" in names
+    assert "up_proj.weight" in names
+    assert "down_proj.weight" in names
+
+
+def test_swiglu_ffn_gradient_flows():
+    ffn = SwiGLUFFN(d_model=16, d_ffn=32)
+    x = torch.randn(2, 4, 16, requires_grad=True)
+    ffn(x).sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    for n, p in ffn.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), f"bad grad on {n}"

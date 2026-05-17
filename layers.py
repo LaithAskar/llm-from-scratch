@@ -160,6 +160,55 @@ class RMSNorm(nn.Module):
         return (x_f32 * rms).to(orig_dtype) * self.weight
 
 
+class GeluFFN(nn.Module):
+    """
+    Classic two-matrix FFN: y = down_proj(GELU(up_proj(x))).
+
+    With d_ffn = 4 * d_model (Vaswani default), this contributes 8 * d_model²
+    params per block — roughly 2x the attention param count, and the bulk of
+    each layer's representational capacity.
+
+    The second linear is named `down_proj` so that model.py's _init_weights
+    can apply GPT-2 style residual scaling via name suffix match.
+    """
+
+    def __init__(self, d_model: int, d_ffn: int, bias: bool = False, dropout: float = 0.0):
+        super().__init__()
+        self.up_proj = nn.Linear(d_model, d_ffn, bias=bias)
+        self.down_proj = nn.Linear(d_ffn, d_model, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.down_proj(F.gelu(self.up_proj(x))))
+
+
+class SwiGLUFFN(nn.Module):
+    """
+    Gated FFN with SiLU activation (Shazeer 2020):
+
+        y = down_proj( silu(gate_proj(x)) * up_proj(x) )
+
+    Three matrices instead of two. The element-wise product is the "gate":
+    silu(gate_proj(x)) decides per-channel how much of up_proj(x) flows
+    through. With d_ffn = (8/3) * d_model (PaLM convention, applied in
+    ModelConfig.__post_init__), total FFN params match a GELU-FFN with
+    d_ffn = 4*d_model — controlled comparison in the ablation.
+
+    Naming: gate_proj, up_proj, down_proj follow the LLaMA convention.
+    down_proj triggers the residual init scaling in model.py.
+    """
+
+    def __init__(self, d_model: int, d_ffn: int, bias: bool = False, dropout: float = 0.0):
+        super().__init__()
+        self.gate_proj = nn.Linear(d_model, d_ffn, bias=bias)
+        self.up_proj = nn.Linear(d_model, d_ffn, bias=bias)
+        self.down_proj = nn.Linear(d_ffn, d_model, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
+
+
 class TransformerBlock(nn.Module):
     """
     One transformer decoder block.
