@@ -57,19 +57,30 @@ GELU-FFN at `4 * d_model`. The `moe` variant uses per-expert
 `d_ffn = d_model` × 4 experts to match the baseline's `4 * d_model` total
 FFN capacity, though *active* params per token are lower (top-2 routing).
 
-**Deliverable:** `runs/ablation/summary.csv` with per-variant best-val,
-final-step val perplexity, and wall-clock; plotting/analysis to follow.
+**Deliverable:** `runs/ablation/summary.csv` (18 runs) + `ABLATION.md`
+writeup with the per-variant best-val, perplexity, wall-clock, and a
+discussion of which switches actually move the needle at toy scale.
+See [ABLATION.md](ABLATION.md) for the results.
 
 ## Status
 
 - Environment verified (Python 3.13, PyTorch 2.6.0+cu124, RTX 4060 8 GB).
-- Infrastructure: `config.py`, `data.py`, `model.py`, `train.py`,
-  `eval.py`, `ablation.py` — **complete**, 28 pytest cases.
+- **Parts 1-5 + Part 3\* (KV cache) + Part 6 (SFT): complete.**
 - `layers.py`: MHA, causal_mask, RMSNorm, GeluFFN, SwiGLUFFN,
-  RotaryEmbedding, TransformerBlock — **complete**, 48 pytest cases.
-- **76 pytest cases passing**, CI green on Python 3.11 + 3.12.
-- TinyStories download + full ablation run: pending.
-- `ABLATION.md` writeup: pending (after the run).
+  RotaryEmbedding, TransformerBlock, MoEFFN.
+- Training infrastructure: `config.py`, `data.py`, `model.py`, `train.py`,
+  `eval.py`, `ablation.py`.
+- Part 3\*: KV cache plumbed through MHA + Block + `TransformerLM.generate`.
+- Part 4: standalone BPE trainer (`bpe.py`) — used by tests; main pipeline
+  uses `tiktoken` GPT-2.
+- Part 5: MoE as a 6th ablation variant (honest negative result; see
+  `ABLATION.md`).
+- Part 6: SFT pipeline (`sft_data.py`, `sft.py`) with fixed-prefix template,
+  loss masking via `ignore_index=-100`, before/after sample showing format
+  learning. Smoke run at `runs/sft/modern/`.
+- Ablation matrix complete: 6 variants × 3 seeds × 2000 steps, 18 runs.
+- **114 pytest cases passing**, CI green on Python 3.11 + 3.12.
+- **Next session:** Parts 7 (RM/RLAIF) → 8 (PPO) → 9 (GRPO).
 
 ## Quickstart
 
@@ -84,43 +95,56 @@ pip install -e ".[dev]"
 # Verify environment
 python verify_setup.py
 
-# Run tests (~5s, 76 cases)
+# Run tests (~8s, 114 cases)
 pytest tests/ -q
 
 # Download + tokenize TinyStories (~2 GB)
 python data.py prepare
 
-# Smoke training: 1 variant, 500 steps
-python ablation.py --max-steps 500 --variants baseline --seeds 0
+# Smoke training: 1 variant, ~200 steps (must exceed warmup_steps)
+python ablation.py --max-steps 200 --variants baseline --seeds 0
 
-# Full ablation: 5 variants × 3 seeds × 5000 steps
-python ablation.py
+# Full ablation: 6 variants × 3 seeds × 2000 steps (~30 min on RTX 4060)
+python ablation.py --seeds 0 1 2
 
-# Use a trained checkpoint
-python eval.py perplexity --ckpt runs/ablation/modern/seed_0/best.pt --data data/tinystories
-python eval.py sample --ckpt runs/ablation/modern/seed_0/best.pt \
-    --prompt "Once upon a time" --max-tokens 100 --top-k 50
+# Plots from runs/ablation/summary.csv
+python plot_ablation.py --root runs/ablation
+
+# Sample from any trained checkpoint
+python generate_sample.py runs/ablation/modern/seed_1/best.pt \
+    --prompt "Once upon a time" --tokens 150
+
+# Part 6: SFT (fixed-prefix template, ~1 min on RTX 4060)
+python sft_data.py prepare --raw data/tinystories --out data/sft
+python sft.py --base runs/ablation/modern/seed_1/best.pt \
+    --data data/sft --out runs/sft/modern --max-steps 500
+python generate_sample.py runs/sft/modern/best.pt \
+    --prompt "Here is a story:
+
+"
 ```
 
 ## Scope decisions (Parts 4-9 and KV cache)
 
-The source video curriculum has nine parts; only Parts 1-3 are implemented.
-Each of the rest was evaluated and scoped out for hardware/dataset reasons
-that are independent of the project's AI-assisted authorship:
+The source video curriculum has nine parts. The original scope plan
+(Parts 1-3 + ablation only) was revised after the authorship reframing
+to a PM/reviewer model (see *Authorship* above). Each remaining part was
+re-scoped to find an honest, in-budget implementation. Status today:
 
-| Part | What                | Why out of scope                                                                                                                       |
-|------|---------------------|----------------------------------------------------------------------------------------------------------------------------------------|
-| 3*   | KV cache            | Inference-only optimization; the ablation measures training quality, not inference latency. Cleanly implementing it without affecting training-path correctness would add 1-2 days for no ablation signal. |
-| 4    | BPE training        | A day of work for ~zero learning over using `tiktoken.get_encoding("gpt2")`. The BPE algorithm is interesting; engineering one is not. |
-| 5    | Mixture of Experts  | 8 GB VRAM cannot hold one expert at the model size where MoE gains become measurable (gating needs ≥~100M dense baseline). MoE on 10M is a toy of a toy. |
-| 6    | Supervised fine-tuning | No relevant instruction dataset exists for a 10M-param TinyStories-trained base. SFT'ing a TinyStories model on Alpaca data is incoherent. |
-| 7    | Reward modeling     | Needs a preference dataset (human ranking of outputs from this specific base). None exists; building one is its own project. |
-| 8    | PPO                 | Requires (6) and (7); compounding the upstream gaps would produce a fake artifact. |
-| 9    | GRPO                | Same constraint as (8). |
+| Part | What                  | Status      | Honest framing                                                                                                                            |
+|------|-----------------------|-------------|-------------------------------------------------------------------------------------------------------------------------------------------|
+| 3\*  | KV cache              | **Done**    | Inference-only optimization. Default `use_cache=True` in `generate`; hard-stops at `context_len`. Verified against the recompute path.   |
+| 4    | BPE training          | **Done**    | Standalone implementation in `bpe.py` with CLI; the main training pipeline still uses `tiktoken.get_encoding("gpt2")` (50257-vocab GPT-2). |
+| 5    | Mixture of Experts    | **Done**    | Added as the 6th ablation variant. **Honest negative result** at this scale — see `ABLATION.md` discussion. Not a win; documented as such. |
+| 6    | Supervised fine-tuning | **Done**   | Fixed-prefix template (`"Here is a story:\n\n"`) over TinyStories. Demonstrates loss-masking + format learning mechanics, not real instruction tuning. Documented as such in `notes/agent_implementation_log.md` §11. |
+| 7    | Reward modeling       | Next session | RLAIF: use Claude/GPT-4 as preference oracle over K policy completions per prompt. ~$5-20 API spend.                                  |
+| 8    | PPO                   | Next session | Standard impl on top of the SFT'd policy + Part 7 RM. ~16 MB extra VRAM for the reference policy at toy scale.                          |
+| 9    | GRPO                  | Next session | DeepSeek group-relative variant on top of the Part 8 PPO infrastructure.                                                                |
 
-A faked Part 4-9 implementation is a worse resume signal than clean Parts
-1-3 + ablation with explicit *why-not* on the rest. The scoping decision
-is itself a project artifact.
+The previous scoping (only Parts 1-3 implemented) was the right call
+under the earlier "no AI on layers.py" rule. Under the current PM/review
+model, each later part has a narrow, honest implementation that's
+documented with its limitations.
 
 ## Hardware
 
@@ -136,25 +160,32 @@ is itself a project artifact.
 .
 ├── config.py                 # ModelConfig / TrainConfig / Config dataclasses
 ├── data.py                   # TinyStories downloader, tiktoken BPE -> uint16 memmap
-├── layers.py                 # MHA, RMSNorm, RoPE, FFNs, TransformerBlock, causal_mask
-├── model.py                  # TransformerLM: embeddings + blocks + tied LM head + generate
+├── layers.py                 # MHA, RMSNorm, RoPE, FFNs, MoEFFN, TransformerBlock, causal_mask
+├── model.py                  # TransformerLM: embeddings + blocks + tied LM head + generate(use_cache=True)
 ├── train.py                  # AdamW + cosine LR + AMP + grad accum + checkpoints
 ├── eval.py                   # Perplexity + sampling from a checkpoint
 ├── ablation.py               # Run all variants × seeds, write summary.csv
+├── bpe.py                    # Part 4: standalone BPE trainer + encode/decode + CLI
+├── sft_data.py               # Part 6: SFT pairs (tokens + loss-mask bin files)
+├── sft.py                    # Part 6: fine-tuning loop with masked CE
+├── generate_sample.py        # Sample text from any pretrained or SFT'd checkpoint
+├── plot_ablation.py          # Loss curves + best-val bar from runs/ablation/
+├── ABLATION.md               # Full ablation writeup with results + discussion
 ├── pyproject.toml            # Project metadata, pytest pythonpath
 ├── verify_setup.py           # CUDA / deps sanity check
 ├── .github/workflows/        # CI: pytest on push/PR, Python 3.11 + 3.12
 ├── notes/
 │   ├── layers_cheatsheet.md            # Concept reference for layers.py
 │   └── agent_implementation_log.md     # Per-component design + walkthrough (review artifact)
-└── tests/                    # 76 pytest cases
-    ├── test_layers.py        # 48 cases over MHA, RMSNorm, RoPE, FFNs, TransformerBlock
-    ├── test_model.py         # 10 cases over the LM wrapper
-    ├── test_train.py         # 4 cases over the training loop
-    ├── test_eval.py          # 4 cases over checkpoint loading + perplexity + sample
-    ├── test_ablation.py      # 3 cases over the ablation runner
-    ├── test_data.py          # 5 cases over the data pipeline
-    └── conftest.py + _dummies.py   # (now mostly vestigial; layers complete)
+└── tests/                    # 114 pytest cases
+    ├── test_layers.py        # MHA, RMSNorm, RoPE, FFNs, TransformerBlock, MoEFFN
+    ├── test_model.py         # LM wrapper (incl. MoE end-to-end)
+    ├── test_train.py         # Training loop
+    ├── test_eval.py          # Checkpoint loading + perplexity + sample
+    ├── test_ablation.py      # Ablation runner (6 variants)
+    ├── test_data.py          # Pretrain data pipeline
+    ├── test_bpe.py           # Standalone BPE trainer
+    └── test_sft.py           # SFT mask construction + masked-CE smoke
 ```
 
 ## CI

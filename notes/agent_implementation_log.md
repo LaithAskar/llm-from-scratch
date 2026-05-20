@@ -1635,3 +1635,157 @@ The hypothesis is that at toy scale, `moe` will roughly match `baseline`
 on val loss but cost slightly more wall-clock (router overhead). The
 real signal would come at 100M+ dense baseline, which is out of scope.
 The `summary.csv` should show whether this hypothesis holds.
+
+**Ablation result (2026-05-20):** `moe` ended up *worse* than `baseline`
+on val loss (3.455 vs 3.417, +0.04 nats) and ~2.6x slower per step
+(251 s/run vs 95 s). See `ABLATION.md` for the full discussion. The
+"slightly more wall-clock" prediction held; the "roughly match" prediction
+was too optimistic — top-2 of 4 experts has ~half the active params per
+token, and at this scale that capacity cut isn't compensated by routing.
+
+---
+
+## 11. SFT (Part 6) — `sft_data.py` + `sft.py`
+
+### Goal
+
+Demonstrate the supervised fine-tuning mechanic on the pretrained model
+(`runs/ablation/modern/seed_1/best.pt`): teach it to follow a fixed
+input format that the base model has never seen. Specifically, after
+SFT the prompt `"Here is a story:\n\n"` should reliably elicit a
+TinyStories-style story.
+
+This is **not** instruction tuning in the modern sense (no chat-format
+data, no held-out instructions). It's the minimum viable demo of:
+(a) loss masking, (b) lower-LR fine-tuning, (c) format learning.
+
+### Design decisions
+
+**Template choice.** Fixed prefix `"Here is a story:\n\n"` on every
+example. Alternatives considered: per-example title extraction
+(`"Story title: <noun phrase>\n\nStory: <body>"`) and question-answer
+phrasings. Rejected for time-budget reasons — the fixed prefix is the
+cleanest demo of the SFT mechanic without per-example NLP preprocessing
+that would add scope without changing the conclusions.
+
+**Loss masking via `ignore_index=-100`.** `TransformerLM.forward` already
+calls `F.cross_entropy(..., ignore_index=-100)`. So masking prompt
+tokens means: produce targets with `-100` wherever loss should be
+skipped, and the existing forward path Just Works. No model surgery.
+
+Concrete pipeline:
+1. `sft_data.py` writes parallel `tokens.bin` (uint16) and `mask.bin`
+   (uint8) where `mask=0` on prompt tokens, `mask=1` on completion + EOT.
+2. `get_sft_batch` samples random windows (sample-with-replacement,
+   matching pretrain), then sets `targets[mask==0] = -100` before
+   returning the tensors.
+3. Training is unchanged from pretrain except for: smaller LR, no
+   weight decay, fewer steps.
+
+**Why no weight decay?** Standard SFT practice. The pretrained weights
+were already regularized during pretraining; further WD during fine-tuning
+just degrades them away from where the pretraining process landed.
+GPT-3/InstructGPT-style fine-tuning recipes follow this. (If we were
+SFT-ing from scratch on a much larger dataset, decay might come back.)
+
+**LR choice.** 3e-5 (one order of magnitude below pretrain's 3e-4).
+Standard rule of thumb: SFT LR should be 1/10 to 1/100 of pretrain LR
+to avoid overwriting the base distribution. At LR=3e-4 the base model
+collapses to producing only the SFT-distribution outputs and forgets
+the rest of the pretraining distribution (catastrophic forgetting).
+
+**Random sampling over example boundaries.** Windows can straddle an
+EOT (end-of-story) and start mid-prefix of the next example. This is
+intentional and matches pretraining's flat-stream sampling. The mask
+remains correct because it was written in lockstep with tokens. The
+alternative (per-example padding) would waste compute on padding tokens
+and complicate the batch interface.
+
+### Why fixed-prefix SFT demonstrates the mechanic honestly
+
+A skeptic asks: "If the base model already produces TinyStories
+continuations from any TinyStories-like prompt, what did SFT actually
+teach?" The answer is in the before/after sample at the same prompt
+`"Here is a story:\n\n"` (seed 42, temp 0.8, top-k 40):
+
+- **Before SFT** (`runs/ablation/modern/seed_1/best.pt`): The base model
+  continues from "Here is a story:" by treating it as mid-document text
+  — it dives into dialogue mid-scene ("She said, 'Wow, Lily. It is a
+  beautiful place.'"). It also emits `<|endoftext|>` mid-output because
+  the token was in pretrain but never used as a clean stop.
+- **After SFT** (`runs/sft/modern/best.pt`): The model recognizes the
+  format and opens with a canonical TinyStories story-start ("One day,
+  a little boy named Lily found a big house in a big room."). No stray
+  `<|endoftext|>`.
+
+So SFT taught a specific behavior: "when you see *this exact prefix*,
+start a fresh story." That's the format-following result that scales
+up to "when you see `<|user|>...<|assistant|>`, respond as the assistant
+would" in real chat-tuned models.
+
+### Test coverage (`tests/test_sft.py`, 5 new tests, 114 total)
+
+- `test_iter_stories_splits_on_eot` — parser correctly splits a synthetic
+  TinyStoriesV2-style file on `<|endoftext|>` separators.
+- `test_mask_zero_on_prefix_one_elsewhere` — after `build_split`, the
+  mask has exactly `n_stories * n_prefix_tokens` zeros and the rest ones.
+- `test_get_sft_batch_sets_targets_to_minus_100_where_mask_zero` —
+  positional alignment: target is `-100` iff `mask=False`, else target
+  is a valid token id (>=0).
+- `test_get_sft_batch_has_some_unmasked_positions` — sanity guardrail.
+  If a window were entirely masked the SFT step would learn nothing.
+  At default settings >50% of positions should be unmasked.
+- `test_sft_one_step_finite_loss_and_grad` — end-to-end: build a tiny
+  TransformerLM, sample an SFT batch, forward + backward, verify loss
+  is finite and at least one parameter received a non-zero gradient.
+
+### Interview-style questions to defend
+
+1. **"Why use `ignore_index=-100` instead of multiplying the per-token
+   loss by a 0/1 mask?"**
+   Both work; `-100` is cleaner because it skips the softmax + log-prob
+   computation for those positions entirely (cross_entropy short-circuits),
+   whereas the multiplicative mask still does the full math and then
+   zeros it out. Memory and FLOPs win, no behavioral difference.
+
+2. **"Why does the mask align with TARGETS (`y`), not INPUTS (`x`)?"**
+   Because the loss at position `t` is on the predicted distribution over
+   *next* token, which is `y[t] = tokens[t+1]`. The mask should describe
+   "do I care about the prediction at this step?" — which is exactly
+   "is the *target* a completion token?" So `mask` is sliced from
+   `tokens[s+1:s+1+T]`, not `tokens[s:s+T]`.
+
+3. **"What goes wrong if we SFT at the pretrain LR (3e-4)?"**
+   Catastrophic forgetting. The pretrained distribution shifts hard
+   toward the narrow SFT distribution. Visible failure mode: the model
+   produces *only* the prefix-following format and forgets how to handle
+   normal continuations. At LR=3e-5 the shift is gentle and the base
+   distribution is mostly preserved outside the prefix.
+
+4. **"Why does the model still confuse pronouns and character names
+   after SFT?"**
+   SFT shifts behavior, not capability. We're still at 566k non-embedding
+   params trained on 4M pretrain tokens + ~150k SFT tokens-of-loss
+   (500 steps × batch 16 × ~18 unmasked positions on average). Pronoun
+   coherence requires long-range bookkeeping the model doesn't have at
+   this scale. SFT can't add capability the base doesn't have.
+
+### Smoke run results (`runs/sft/modern/`)
+
+- 500 steps, LR 3e-5 (cosine to 3e-6), warmup 50, batch 8 × accum 2.
+- Wall clock: ~34 s on RTX 4060.
+- Val loss trajectory: 3.41 (step 100) → 3.37 (step 300, best) → 3.39
+  (step 400). Modest absolute change because the base model is already
+  good at TinyStories continuation; SFT is teaching format, not content.
+- Best checkpoint at step 300 (`runs/sft/modern/best.pt`).
+
+### Open follow-ups for Parts 7-9
+
+- The current SFT bin has no per-example-boundary metadata, so we can't
+  build purely per-example batches. For RLHF rollouts (Part 8 PPO) we
+  need per-prompt generation, which means a different data interface
+  — likely a separate `prompts.jsonl` emitted alongside the SFT bin,
+  or rebuilding the bin with offset metadata.
+- For Part 7 (RM/RLAIF): the SFT'd model is the rollout policy. We'll
+  need to generate K completions per prompt and ask Claude/GPT-4 to
+  pick a winner. API cost estimate: ~$5-20 depending on prompt count.
