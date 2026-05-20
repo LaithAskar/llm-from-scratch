@@ -27,10 +27,12 @@ wandb/
 lightning_logs/
 
 # Data — don't commit large or copyrighted corpora
-data/raw/
-data/cache/
+data/
 *.bin
 *.npy
+
+# Top-level transient logs from background runs
+*.log
 
 # Editor / OS
 .vscode/
