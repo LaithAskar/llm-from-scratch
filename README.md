@@ -49,11 +49,13 @@ parameter count across all variants. Single architecture knob per row:
 | `rope`      | LayerNorm   | GELU           | RoPE              |
 | `swiglu`    | LayerNorm   | SwiGLU         | Learned-absolute  |
 | `modern`    | RMSNorm     | SwiGLU         | RoPE              |
+| `moe`       | LayerNorm   | GELU (4 experts, top-2) | Learned-absolute |
 
 Parameter count is held constant via PaLM's `d_ffn = (8/3) * d_model` rule
 for SwiGLU variants — three FFN matrices sized to match a two-matrix
-GELU-FFN at `4 * d_model`. Any quality delta is attributable to the
-architecture knob, not param count.
+GELU-FFN at `4 * d_model`. The `moe` variant uses per-expert
+`d_ffn = d_model` × 4 experts to match the baseline's `4 * d_model` total
+FFN capacity, though *active* params per token are lower (top-2 routing).
 
 **Deliverable:** `runs/ablation/summary.csv` with per-variant best-val,
 final-step val perplexity, and wall-clock; plotting/analysis to follow.
