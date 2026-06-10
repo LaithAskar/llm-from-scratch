@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "llm-from-scratch-laith"
 version = "0.1.0"
-description = "Transformer LM built from scratch (Parts 1-3) + controlled architectural ablation. AI-implemented, human-supervised."
+description = "Transformer LM built from scratch + controlled ablation + educational SFT/RM/PPO/GRPO mechanics. AI-implemented, human-supervised."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
@@ -24,7 +24,7 @@ dev = ["pytest>=8.0"]
 [tool.setuptools]
 # Single-module layout: each .py at repo root is its own importable module.
 # Don't try to autodetect packages — there's no src/ tree and tests/ is not a package.
-py-modules = ["config", "data", "layers", "model", "train", "eval", "ablation", "bpe", "verify_setup"]
+py-modules = ["config", "data", "layers", "model", "train", "eval", "ablation", "bpe", "sft_data", "sft", "preferences", "reward_model", "ppo", "grpo", "verify_setup"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

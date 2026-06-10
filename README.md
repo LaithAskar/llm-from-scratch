@@ -17,8 +17,12 @@ This is an **AI-assisted, human-supervised** project. Honest split of work:
   `layers.py` (MultiHeadAttention, RMSNorm, RotaryEmbedding, GeluFFN,
   SwiGLUFFN, TransformerBlock, causal_mask), surrounding infrastructure
   (`config.py`, `data.py`, `model.py`, `train.py`, `eval.py`,
-  `ablation.py`), the 76-case test suite, the CI workflow, and the
-  implementation log.
+  `ablation.py`), the original 114-case test suite, the CI workflow, and
+  the implementation log.
+- **Hermes Agent (OpenAI Codex, GPT-5.5):** Part 7-9 educational RLHF/RLAIF
+  completion: `preferences.py`, `reward_model.py`, `ppo.py`, `grpo.py`,
+  `tests/test_rlhf.py`, and the README updates documenting what was and was
+  not completed.
 
 A per-component **implementation log** with design rationale,
 interview-style defense questions, and pitfall notes lives at
@@ -65,7 +69,7 @@ See [ABLATION.md](ABLATION.md) for the results.
 ## Status
 
 - Environment verified (Python 3.13, PyTorch 2.6.0+cu124, RTX 4060 8 GB).
-- **Parts 1-5 + Part 3\* (KV cache) + Part 6 (SFT): complete.**
+- **Parts 1-9 complete in an educational/smoke-tested form.**
 - `layers.py`: MHA, causal_mask, RMSNorm, GeluFFN, SwiGLUFFN,
   RotaryEmbedding, TransformerBlock, MoEFFN.
 - Training infrastructure: `config.py`, `data.py`, `model.py`, `train.py`,
@@ -78,9 +82,19 @@ See [ABLATION.md](ABLATION.md) for the results.
 - Part 6: SFT pipeline (`sft_data.py`, `sft.py`) with fixed-prefix template,
   loss masking via `ignore_index=-100`, before/after sample showing format
   learning. Smoke run at `runs/sft/modern/`.
+- Part 7: reward-modeling mechanics (`preferences.py`, `reward_model.py`):
+  JSONL preference triples, padding/collation, scalar reward model, and
+  Bradley-Terry pairwise preference loss. No paid RLAIF judge calls were run.
+- Part 8: PPO mechanics (`ppo.py`): response sequence log-probs, clipped PPO
+  objective, value loss, KL helper, and GAE.
+- Part 9: GRPO mechanics (`grpo.py`): group-relative reward normalization and
+  PPO-style clipped policy loss without a learned value critic.
 - Ablation matrix complete: 6 variants × 3 seeds × 2000 steps, 18 runs.
-- **114 pytest cases passing**, CI green on Python 3.11 + 3.12.
-- **Next session:** Parts 7 (RM/RLAIF) → 8 (PPO) → 9 (GRPO).
+- **121 pytest cases passing** locally on macOS Python 3.11 / torch 2.12 CPU.
+  CI was previously green on Python 3.11 + 3.12 before the Part 7-9 local
+  additions; push/PR CI should be checked before merging.
+- **No claim is made that RM/PPO/GRPO were trained to useful alignment quality**;
+  the implementation completes the course mechanics with unit/smoke tests.
 
 ## Quickstart
 
@@ -122,6 +136,14 @@ python generate_sample.py runs/sft/modern/best.pt \
     --prompt "Here is a story:
 
 "
+
+# Parts 7-9 mechanics: reward model / PPO / GRPO unit tests
+pytest tests/test_rlhf.py -q
+
+# Optional Part 7 reward-model smoke trainer once you have preference JSONL
+# rows shaped like: {"prompt_ids": [...], "chosen_ids": [...], "rejected_ids": [...]}
+python reward_model.py --data data/preferences/train.jsonl \
+    --out runs/reward_model/default --max-steps 500
 ```
 
 ## Scope decisions (Parts 4-9 and KV cache)
@@ -137,9 +159,9 @@ re-scoped to find an honest, in-budget implementation. Status today:
 | 4    | BPE training          | **Done**    | Standalone implementation in `bpe.py` with CLI; the main training pipeline still uses `tiktoken.get_encoding("gpt2")` (50257-vocab GPT-2). |
 | 5    | Mixture of Experts    | **Done**    | Added as the 6th ablation variant. **Honest negative result** at this scale — see `ABLATION.md` discussion. Not a win; documented as such. |
 | 6    | Supervised fine-tuning | **Done**   | Fixed-prefix template (`"Here is a story:\n\n"`) over TinyStories. Demonstrates loss-masking + format learning mechanics, not real instruction tuning. Documented as such in `notes/agent_implementation_log.md` §11. |
-| 7    | Reward modeling       | Next session | RLAIF: use Claude/GPT-4 as preference oracle over K policy completions per prompt. ~$5-20 API spend.                                  |
-| 8    | PPO                   | Next session | Standard impl on top of the SFT'd policy + Part 7 RM. ~16 MB extra VRAM for the reference policy at toy scale.                          |
-| 9    | GRPO                  | Next session | DeepSeek group-relative variant on top of the Part 8 PPO infrastructure.                                                                |
+| 7    | Reward modeling       | **Done**    | Educational mechanics: JSONL preference triples, reward model scalar head, Bradley-Terry pairwise loss. RLAIF judge calls were not run; use approved API budget before generating real preference labels. |
+| 8    | PPO                   | **Done**    | Core PPO math implemented/tested: sequence log-probs, clipped policy objective, value loss, KL helper, and GAE. No long RL run is claimed. |
+| 9    | GRPO                  | **Done**    | Group-relative reward normalization + clipped policy loss without a critic. Smoke-tested mechanics only; no DeepSeek-scale training claim. |
 
 The previous scoping (only Parts 1-3 implemented) was the right call
 under the earlier "no AI on layers.py" rule. Under the current PM/review
@@ -168,6 +190,10 @@ documented with its limitations.
 ├── bpe.py                    # Part 4: standalone BPE trainer + encode/decode + CLI
 ├── sft_data.py               # Part 6: SFT pairs (tokens + loss-mask bin files)
 ├── sft.py                    # Part 6: fine-tuning loop with masked CE
+├── preferences.py            # Part 7: preference JSONL loading + collation
+├── reward_model.py           # Part 7: scalar reward model + pairwise RM loss
+├── ppo.py                    # Part 8: PPO log-prob/objective/value/GAE helpers
+├── grpo.py                   # Part 9: group-relative advantages + GRPO loss
 ├── generate_sample.py        # Sample text from any pretrained or SFT'd checkpoint
 ├── plot_ablation.py          # Loss curves + best-val bar from runs/ablation/
 ├── ABLATION.md               # Full ablation writeup with results + discussion
@@ -185,7 +211,8 @@ documented with its limitations.
     ├── test_ablation.py      # Ablation runner (6 variants)
     ├── test_data.py          # Pretrain data pipeline
     ├── test_bpe.py           # Standalone BPE trainer
-    └── test_sft.py           # SFT mask construction + masked-CE smoke
+    ├── test_sft.py           # SFT mask construction + masked-CE smoke
+    └── test_rlhf.py          # Parts 7-9 reward model, PPO, GRPO mechanics
 ```
 
 ## CI
