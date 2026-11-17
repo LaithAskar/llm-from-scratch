@@ -78,9 +78,15 @@ See [ABLATION.md](ABLATION.md) for the results.
 - Part 6: SFT pipeline (`sft_data.py`, `sft.py`) with fixed-prefix template,
   loss masking via `ignore_index=-100`, before/after sample showing format
   learning. Smoke run at `runs/sft/modern/`.
+- Part 7: reward model (`reward_model.py`, `preference_data.py`,
+  `train_rm.py`). Bradley-Terry pairwise loss, RM trunk init from the SFT
+  checkpoint. Preference oracle is an interface; today's run uses a
+  transparent **heuristic** oracle (no API) — `ApiOracle` for real RLAIF
+  is wired but inert until a key exists. RM reaches 0.886 held-out
+  preference accuracy. Smoke run at `runs/rm/modern/`.
 - Ablation matrix complete: 6 variants × 3 seeds × 2000 steps, 18 runs.
-- **114 pytest cases passing**, CI green on Python 3.11 + 3.12.
-- **Next session:** Parts 7 (RM/RLAIF) → 8 (PPO) → 9 (GRPO).
+- **129 pytest cases passing**, CI green on Python 3.11 + 3.12.
+- **Next:** Part 8 (PPO) → Part 9 (GRPO).
 
 ## Quickstart
 
@@ -122,6 +128,14 @@ python generate_sample.py runs/sft/modern/best.pt \
     --prompt "Here is a story:
 
 "
+
+# Part 7: reward model
+#   rollout K completions per prompt, label preferences (heuristic = no API)
+python preference_data.py rollout --policy runs/sft/modern/best.pt \
+    --out data/prefs/pairs.jsonl --n-prompts 64 --k 4 --oracle heuristic
+#   for real RLAIF instead: --oracle anthropic  (needs ANTHROPIC_API_KEY)
+python train_rm.py --base runs/sft/modern/best.pt \
+    --prefs data/prefs/pairs.jsonl --out runs/rm/modern --max-steps 300
 ```
 
 ## Scope decisions (Parts 4-9 and KV cache)
@@ -137,9 +151,9 @@ re-scoped to find an honest, in-budget implementation. Status today:
 | 4    | BPE training          | **Done**    | Standalone implementation in `bpe.py` with CLI; the main training pipeline still uses `tiktoken.get_encoding("gpt2")` (50257-vocab GPT-2). |
 | 5    | Mixture of Experts    | **Done**    | Added as the 6th ablation variant. **Honest negative result** at this scale — see `ABLATION.md` discussion. Not a win; documented as such. |
 | 6    | Supervised fine-tuning | **Done**   | Fixed-prefix template (`"Here is a story:\n\n"`) over TinyStories. Demonstrates loss-masking + format learning mechanics, not real instruction tuning. Documented as such in `notes/agent_implementation_log.md` §11. |
-| 7    | Reward modeling       | Next session | RLAIF: use Claude/GPT-4 as preference oracle over K policy completions per prompt. ~$5-20 API spend.                                  |
-| 8    | PPO                   | Next session | Standard impl on top of the SFT'd policy + Part 7 RM. ~16 MB extra VRAM for the reference policy at toy scale.                          |
-| 9    | GRPO                  | Next session | DeepSeek group-relative variant on top of the Part 8 PPO infrastructure.                                                                |
+| 7    | Reward modeling       | **Done**    | Bradley-Terry RM, trunk init from SFT. Preference oracle is an interface: today's RM is trained against a transparent **heuristic** oracle (no API spend). `ApiOracle` for real RLAIF is implemented but inert until an API key exists. Honest framing in §12 — this RM imitates a heuristic, not LLM judgement, until the oracle is swapped. |
+| 8    | PPO                   | Next        | Standard impl on top of the SFT'd policy + Part 7 RM. ~28 MB for the 4 model instances at toy scale.                                    |
+| 9    | GRPO                  | Next        | DeepSeek group-relative variant on top of the Part 8 PPO infrastructure.                                                                |
 
 The previous scoping (only Parts 1-3 implemented) was the right call
 under the earlier "no AI on layers.py" rule. Under the current PM/review
@@ -168,6 +182,9 @@ documented with its limitations.
 ├── bpe.py                    # Part 4: standalone BPE trainer + encode/decode + CLI
 ├── sft_data.py               # Part 6: SFT pairs (tokens + loss-mask bin files)
 ├── sft.py                    # Part 6: fine-tuning loop with masked CE
+├── reward_model.py           # Part 7: RewardModel + Bradley-Terry loss
+├── preference_data.py        # Part 7: rollouts, preference oracle (heuristic / API)
+├── train_rm.py               # Part 7: reward-model training loop
 ├── generate_sample.py        # Sample text from any pretrained or SFT'd checkpoint
 ├── plot_ablation.py          # Loss curves + best-val bar from runs/ablation/
 ├── ABLATION.md               # Full ablation writeup with results + discussion
@@ -177,7 +194,7 @@ documented with its limitations.
 ├── notes/
 │   ├── layers_cheatsheet.md            # Concept reference for layers.py
 │   └── agent_implementation_log.md     # Per-component design + walkthrough (review artifact)
-└── tests/                    # 114 pytest cases
+└── tests/                    # 129 pytest cases
     ├── test_layers.py        # MHA, RMSNorm, RoPE, FFNs, TransformerBlock, MoEFFN
     ├── test_model.py         # LM wrapper (incl. MoE end-to-end)
     ├── test_train.py         # Training loop
@@ -185,7 +202,8 @@ documented with its limitations.
     ├── test_ablation.py      # Ablation runner (6 variants)
     ├── test_data.py          # Pretrain data pipeline
     ├── test_bpe.py           # Standalone BPE trainer
-    └── test_sft.py           # SFT mask construction + masked-CE smoke
+    ├── test_sft.py           # SFT mask construction + masked-CE smoke
+    └── test_reward.py        # Reward model, BT loss, preference oracle
 ```
 
 ## CI

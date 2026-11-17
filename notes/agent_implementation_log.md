@@ -1789,3 +1789,163 @@ would" in real chat-tuned models.
 - For Part 7 (RM/RLAIF): the SFT'd model is the rollout policy. We'll
   need to generate K completions per prompt and ask Claude/GPT-4 to
   pick a winner. API cost estimate: ~$5-20 depending on prompt count.
+
+---
+
+## 12. Reward model (Part 7) — `reward_model.py`, `preference_data.py`, `train_rm.py`
+
+### Goal
+
+Build the reward model stage of the RLHF pipeline: a model that maps a
+completion to a scalar "how good is this" score, trained on *pairwise
+preferences*. This RM becomes the reward signal for PPO (Part 8).
+
+### Honest framing — read this first
+
+The intended preference signal is **RLAIF**: an LLM (Claude/GPT-4) judges
+which of two completions is the better children's story. As of this entry
+no API key is available, so the RM was trained against a **heuristic
+placeholder oracle** — a transparent, hand-written scoring function.
+
+What this means precisely:
+- The RM *pipeline* is complete, tested, and demonstrably works: it
+  reaches **0.886 held-out preference accuracy** (chance = 0.5).
+- But it learned to imitate a *heuristic*, not real LLM judgement. The
+  heuristic is honest about what it measures (repetition + stray EOT)
+  and nothing more. Do not describe this RM as "trained on AI feedback"
+  until `ApiOracle` is wired with a key.
+- Swapping in the real oracle is a one-flag change
+  (`--oracle anthropic`); the rest of the pipeline is unchanged.
+
+### `reward_model.py` — architecture
+
+`RewardModel` wraps a `TransformerLM` trunk and adds
+`reward_head: Linear(d_model, 1)`. The reward is read from the hidden
+state at the **last real token** of the sequence.
+
+- **Why the last token?** A causal transformer's hidden state at
+  position `t` summarises tokens `0..t`. The last real token's hidden
+  state is therefore the only position that has "seen" the whole
+  sequence. Standard RLHF practice (InstructGPT, the TRL library).
+- **Why padding is safe.** Sequences in a batch are right-padded to a
+  common width. Because attention is causal, a token at position `t`
+  cannot attend to positions `> t`, so pad tokens *after* the last real
+  token cannot change its hidden state. `test_reward_ignores_padding_after_last_real_token`
+  verifies this empirically with two different pad values.
+- **`model.py` change:** extracted the shared cache-free forward into
+  `TransformerLM._trunk`, exposed via `hidden_states()`. `forward`
+  (training) and `hidden_states` (RM scoring) now share one code path —
+  no duplication, and the 23 existing model/train/eval tests still pass.
+
+**Why init the RM trunk from the SFT checkpoint?** The trunk already has
+a good representation of TinyStories text from pretraining + SFT. Training
+the RM from random init would waste the preference data re-learning
+language modelling. Standard RLHF: RM starts from the SFT policy, only the
+scalar head is fully fresh.
+
+### Bradley-Terry loss
+
+`loss = -log sigmoid(r_chosen - r_rejected)`.
+
+- Derives from the Bradley-Terry model of pairwise comparison:
+  `P(A beats B) = sigmoid(r_A - r_B)`. Minimising the negative log
+  likelihood of the observed preferences gives the loss above.
+- **Only the *difference* of rewards is supervised.** The absolute scale
+  and offset of `r` are unidentifiable — add a constant to every reward
+  and the loss is unchanged. This is fine: PPO only uses reward
+  *differences* (advantages), never absolute reward.
+- Implemented with `F.logsigmoid`, which is numerically stable across the
+  whole range — no manual clamping. `test_bt_loss_at_equal_rewards_is_log2`
+  pins the `r_chosen == r_rejected` case to `-log(0.5) = log 2`.
+
+### `preference_data.py` — the oracle interface
+
+`PreferenceOracle` is an ABC with one method `prefer(prompt, A, B) -> {0,1,-1}`
+(-1 = skip the pair, e.g. a tie). Two implementations:
+
+**`HeuristicOracle`** — deterministic. Scores each completion with
+`quality_score`, which measures two things the toy model genuinely gets
+wrong:
+1. **distinct-2**: fraction of distinct bigrams. Repetitive babble
+   ("He was happy. He was happy.") scores low.
+2. **stray-EOT penalty**: `<|endoftext|>` before the final position means
+   the model failed to produce one clean story.
+
+Ties (equal score) are skipped so the training signal stays clean.
+
+**`ApiOracle`** — asks Claude/GPT-4 which completion is the better story.
+The real RLAIF signal. Defensive design:
+- Lazy client construction: the module imports fine without the
+  `anthropic`/`openai` packages or a key; the error only fires on first
+  actual use.
+- **Hard spend cap**: every call increments an estimated-cost counter;
+  once the next call would exceed `max_spend_usd` the oracle *raises*
+  instead of spending. The cap is the floor of safety, not a target.
+
+### Rollout + dataset
+
+`rollout_completions` generates `k` completions per prompt by repeating
+the prompt `k` times in the batch and calling `policy.generate`. All
+`k*(k-1)/2` pairs per prompt are labelled. The result is JSONL of
+`{prompt, chosen, rejected}` token-id triples.
+
+`PreferenceDataset` + `collate_preference_batch` load that JSONL and build
+padded batches. The RM scores `prompt + completion` concatenated; the
+prompt is identical within a pair so it cancels in the BT difference, but
+feeding the whole sequence is the convention and keeps the interface to
+PPO uniform.
+
+### Smoke run results (`runs/rm/modern/`)
+
+- 350 preference pairs from 64 prompts × 4 completions (34 ties skipped),
+  heuristic oracle. Train/val split 315/35.
+- RM trunk from `runs/sft/modern/best.pt`; 300 steps, LR 1e-4.
+- BT loss 0.68 (chance) → ~0.10 train. **Best held-out preference
+  accuracy 0.886**, final 0.857.
+- Mild overfit: train acc hits 1.0 while val plateaus ~0.85 — expected
+  with only 315 train pairs. `best.pt` saved at the val-acc peak.
+
+### Test coverage (`tests/test_reward.py`, 15 new tests, 129 total)
+
+RewardModel: output shape, length validation, **padding-invariance**
+(score unchanged when pad value changes). BT loss: `log 2` at equal
+rewards, monotonic decrease with margin, gradient pushes rewards apart.
+`preference_accuracy`. Heuristic: repetition + stray-EOT penalties,
+oracle prefers higher quality, skips ties. Dataset: load/concatenate,
+context-len truncation, padding + length bookkeeping. End-to-end one-step
+RM smoke (finite loss, gradient reaches the reward head).
+
+### Interview-style questions to defend
+
+1. **"The reward model's absolute output is meaningless — why is that OK?"**
+   BT loss only constrains reward *differences*. PPO consumes advantages
+   (reward differences relative to a baseline), never absolute reward, so
+   an unidentifiable global offset/scale never matters downstream.
+
+2. **"Why read the reward from the last token, not a mean over tokens?"**
+   In a causal transformer only the last token's hidden state has
+   attended to the entire sequence. A mean-pool would dilute that with
+   early-position states that haven't seen the completion. Last-token is
+   the InstructGPT/TRL convention for exactly this reason.
+
+3. **"What's the risk of RLAIF vs human feedback?"**
+   The RM inherits the judge LLM's biases (length bias, formatting
+   preferences, sycophancy). It can only be as good as the oracle. The
+   heuristic oracle used here is even more limited — it's an explicit
+   stand-in, and the writeup says so.
+
+4. **"You init the RM from the SFT model — could you instead init from
+   the base pretrained model?"**
+   Yes, and people do. SFT-init is the common default because the SFT
+   model is already on the distribution the RM will score (it generated
+   the rollouts). Base-init also works but wastes preference data
+   re-learning representation the SFT model already has.
+
+### Open follow-ups for Part 8 (PPO)
+
+- The RM `best.pt` is the reward signal. PPO needs: a frozen copy of the
+  SFT policy as the KL-reference, a trainable policy copy, the RM, and a
+  value head. Four model instances — at toy scale ~28 MB total, fine on
+  8 GB.
+- PPO rollouts need per-prompt generation; `rollout_completions` already
+  does this and can be reused.

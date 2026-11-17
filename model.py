@@ -101,11 +101,13 @@ class TransformerLM(nn.Module):
             # lm_head is tied to tok_emb, already excluded above.
         return n
 
-    def forward(
-        self,
-        idx: torch.Tensor,                       # (B, T) int64
-        targets: Optional[torch.Tensor] = None,  # (B, T) int64 or None
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def _trunk(self, idx: torch.Tensor) -> torch.Tensor:
+        """Embedding -> blocks -> final norm. Returns post-norm hidden (B, T, C).
+
+        The cache-free path shared by `forward` (training) and
+        `hidden_states` (reward-model scoring). The KV-cached decode path
+        in `generate` is separate.
+        """
         B, T = idx.shape
         if T > self.config.context_len:
             raise ValueError(
@@ -123,7 +125,19 @@ class TransformerLM(nn.Module):
         for block in self.blocks:
             h = block(h, mask=mask)
 
-        h = self.final_norm(h)
+        return self.final_norm(h)
+
+    def hidden_states(self, idx: torch.Tensor) -> torch.Tensor:
+        """Post-final-norm hidden states (B, T, C). Used by the reward model
+        to read a representation it can map to a scalar."""
+        return self._trunk(idx)
+
+    def forward(
+        self,
+        idx: torch.Tensor,                       # (B, T) int64
+        targets: Optional[torch.Tensor] = None,  # (B, T) int64 or None
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        h = self._trunk(idx)
         logits = self.lm_head(h)                            # (B, T, V)
 
         loss: Optional[torch.Tensor] = None
